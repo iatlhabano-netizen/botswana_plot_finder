@@ -8,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:proj4dart/proj4dart.dart' as proj4;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:botswana_plot_finder/plot_exporter.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,25 +33,151 @@ class BotswanaPlotFinderApp extends StatelessWidget {
 }
 
 // -------------------------------------------------------------
-// Coordinate Engine (Cape Datum / WGS84 South-Oriented Lo Proj)
+// Country / Datum Presets
+// -------------------------------------------------------------
+class CountrySystem {
+  final String id;
+  final String label;
+  final List<int> availableZones;
+  final String defaultDatum;
+
+  const CountrySystem({
+    required this.id,
+    required this.label,
+    required this.availableZones,
+    required this.defaultDatum,
+  });
+}
+
+class DatumOption {
+  final String key;
+  final String label;
+
+  const DatumOption({required this.key, required this.label});
+}
+
+// -------------------------------------------------------------
+// Coordinate Engine (Multi-Country South-Oriented Lo Proj)
 // -------------------------------------------------------------
 class LoConverter {
-  static ll.LatLng toWgs84(double yWesting, double xSouthing, {int zone = 25, String datum = 'cape'}) {
+  static const List<CountrySystem> supportedCountries = [
+    CountrySystem(
+      id: 'BW',
+      label: 'Botswana',
+      availableZones: [21, 23, 25, 27, 29],
+      defaultDatum: 'bw_cape',
+    ),
+    CountrySystem(
+      id: 'ZA',
+      label: 'South Africa',
+      availableZones: [17, 19, 21, 23, 25, 27, 29, 31, 33],
+      defaultDatum: 'za_hart94',
+    ),
+    CountrySystem(
+      id: 'NA',
+      label: 'Namibia',
+      availableZones: [11, 13, 15, 17, 19],
+      defaultDatum: 'na_schwarzeck',
+    ),
+    CountrySystem(
+      id: 'ZW',
+      label: 'Zimbabwe',
+      availableZones: [27, 29, 31, 33],
+      defaultDatum: 'zw_arc1950',
+    ),
+    CountrySystem(
+      id: 'SZ',
+      label: 'Eswatini',
+      availableZones: [31],
+      defaultDatum: 'sz_cape',
+    ),
+    CountrySystem(
+      id: 'LS',
+      label: 'Lesotho',
+      availableZones: [27, 29],
+      defaultDatum: 'ls_cape',
+    ),
+  ];
+
+  static List<DatumOption> availableDatums(String countryCode) {
+    switch (countryCode) {
+      case 'ZA':
+        return const [
+          DatumOption(key: 'za_hart94', label: 'Hartebeesthoek94 (Modern / WGS84)'),
+          DatumOption(key: 'za_cape', label: 'Cape Datum (Legacy / Clarke 1880)'),
+        ];
+      case 'NA':
+        return const [
+          DatumOption(key: 'na_schwarzeck', label: 'Schwarzeck (Bessel 1841)'),
+        ];
+      case 'ZW':
+        return const [
+          DatumOption(key: 'zw_arc1950', label: 'Arc 1950 (Clarke 1880 Modified)'),
+        ];
+      case 'SZ':
+        return const [
+          DatumOption(key: 'sz_cape', label: 'Cape Datum (Clarke 1880)'),
+        ];
+      case 'LS':
+        return const [
+          DatumOption(key: 'ls_cape', label: 'Cape Datum (Clarke 1880)'),
+        ];
+      case 'BW':
+      default:
+        return const [
+          DatumOption(key: 'bw_cape', label: 'Cape Datum (Legacy / Clarke 1880)'),
+          DatumOption(key: 'bw_btrs02', label: 'BTRS02 / Modern (WGS84)'),
+        ];
+    }
+  }
+
+  static ll.LatLng toWgs84(
+    double yWesting,
+    double xSouthing, {
+    required int zone,
+    required String datumKey,
+  }) {
     String projDef;
-    if (datum == 'cape') {
-      projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-160,-22,-302,0,0,0,0 +units=m +no_defs';
-    } else {
-      projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +datum=WGS84 +units=m +no_defs';
+
+    switch (datumKey) {
+      // South Africa Modern (Hartebeesthoek94 matches WGS84)
+      case 'za_hart94':
+      case 'bw_btrs02':
+      case 'wgs84':
+        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +datum=WGS84 +units=m +no_defs';
+        break;
+
+      // South Africa / Eswatini / Lesotho Legacy Cape Datum
+      case 'za_cape':
+      case 'sz_cape':
+      case 'ls_cape':
+        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
+        break;
+
+      // Namibia Schwarzeck (Bessel 1841 ellipsoid)
+      case 'na_schwarzeck':
+        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
+        break;
+
+      // Zimbabwe Arc 1950 Datum
+      case 'zw_arc1950':
+        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
+        break;
+
+      // Botswana Legacy Cape Datum (Clarke 1880)
+      case 'bw_cape':
+      default:
+        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-160,-22,-302,0,0,0,0 +units=m +no_defs';
+        break;
     }
 
-    final projSrc = proj4.Projection.add('LO_${zone}_$datum', projDef);
+    final projSrc = proj4.Projection.add('LO_${zone}_$datumKey', projDef);
     final projWgs84 = proj4.Projection.get('EPSG:4326')!;
 
-    // Pass [Y, X] into transformation because axis=wsu maps X=Westing, Y=Southing
     final pt = proj4.Point(x: yWesting, y: xSouthing);
     final result = projSrc.transform(projWgs84, pt);
 
-    return ll.LatLng(result.y, result.x); // y = Latitude, x = Longitude
+    return ll.LatLng(result.y, result.x);
   }
 }
 
@@ -58,12 +185,9 @@ class LoConverter {
 // Area Calculator (Shoelace formula in hectares)
 // -------------------------------------------------------------
 class PlotArea {
-  // Great-circle shoelace area approximation using local UTM-like planar
-  // projection centered at the polygon centroid.
   static double toHectares(List<ll.LatLng> points) {
     if (points.length < 3) return 0.0;
 
-    // Center of the polygon for a local equirectangular approximation.
     double lat0 = points.map((p) => p.latitude).reduce((a, b) => a + b) / points.length;
     double lon0 = points.map((p) => p.longitude).reduce((a, b) => a + b) / points.length;
 
@@ -82,7 +206,7 @@ class PlotArea {
     }
 
     double areaSqm = sum.abs() / 2.0;
-    return areaSqm / 10000.0; // hectares
+    return areaSqm / 10000.0;
   }
 }
 
@@ -96,7 +220,6 @@ class BushNavigator {
     double d13 = _distance(start, current) / earthRadius;
     double theta13 = _bearing(start, current);
     double theta12 = _bearing(start, end);
-
     return asin(sin(d13) * sin(theta13 - theta12)) * earthRadius;
   }
 
@@ -112,7 +235,6 @@ class BushNavigator {
     double lat1 = p1.latitude * pi / 180;
     double lat2 = p2.latitude * pi / 180;
     double dLon = (p2.longitude - p1.longitude) * pi / 180;
-
     double y = sin(dLon) * cos(lat2);
     double x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
     return atan2(y, x);
@@ -143,8 +265,9 @@ class MainHomeScreen extends StatefulWidget {
 }
 
 class _MainHomeScreenState extends State<MainHomeScreen> {
+  CountrySystem _selectedCountry = LoConverter.supportedCountries[0]; // Botswana
   int _selectedZone = 25;
-  String _selectedDatum = 'cape';
+  String _selectedDatum = 'bw_cape';
   final List<CornerInput> _corners = [
     CornerInput('-74283', '2609149'),
     CornerInput('-74593', '2609153'),
@@ -162,6 +285,16 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       c.xController.dispose();
     }
     super.dispose();
+  }
+
+  void _onCountryChanged(CountrySystem newCountry) {
+    setState(() {
+      _selectedCountry = newCountry;
+      _selectedZone = newCountry.availableZones.contains(_selectedZone)
+          ? _selectedZone
+          : newCountry.availableZones.first;
+      _selectedDatum = newCountry.defaultDatum;
+    });
   }
 
   void _addCorner() {
@@ -222,7 +355,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       final y = double.tryParse(corner.yController.text.trim());
       final x = double.tryParse(corner.xController.text.trim());
       if (y != null && x != null) {
-        points.add(LoConverter.toWgs84(y, x, zone: _selectedZone, datum: _selectedDatum));
+        points.add(LoConverter.toWgs84(y, x, zone: _selectedZone, datumKey: _selectedDatum));
       }
     }
     return points;
@@ -243,6 +376,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
         builder: (context) => PlotMapScreen(
           points: points,
           zone: _selectedZone,
+          datumKey: _selectedDatum,
         ),
       ),
     );
@@ -250,9 +384,11 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final datums = LoConverter.availableDatums(_selectedCountry.id);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Botswana Plot Finder', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        title: const Text('Plot Finder', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         backgroundColor: const Color(0xFF0070BA),
         actions: [
           IconButton(
@@ -274,26 +410,39 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                 padding: const EdgeInsets.all(16.0),
                 child: Column(
                   children: [
+                    // Country selector
+                    DropdownButtonFormField<CountrySystem>(
+                      value: _selectedCountry,
+                      decoration: const InputDecoration(labelText: 'Country', border: OutlineInputBorder()),
+                      items: LoConverter.supportedCountries.map((c) {
+                        return DropdownMenuItem(value: c, child: Text('${c.label} (${c.id})'));
+                      }).toList(),
+                      onChanged: (val) {
+                        if (val != null) _onCountryChanged(val);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+
+                    // Zone selector (dynamic per country)
                     DropdownButtonFormField<int>(
-                      value: _selectedZone,
+                      value: _selectedCountry.availableZones.contains(_selectedZone)
+                          ? _selectedZone
+                          : _selectedCountry.availableZones.first,
                       decoration: const InputDecoration(labelText: 'Lo Central Meridian', border: OutlineInputBorder()),
-                      items: const [
-                        DropdownMenuItem(value: 21, child: Text('Lo21 (Western Kalahari / Ghanzi)')),
-                        DropdownMenuItem(value: 23, child: Text('Lo23 (Ngamiland / Kgalagadi)')),
-                        DropdownMenuItem(value: 25, child: Text('Lo25 (Gaborone / Kweneng / Lephephe)')),
-                        DropdownMenuItem(value: 27, child: Text('Lo27 (Francistown / Central District)')),
-                        DropdownMenuItem(value: 29, child: Text('Lo29 (Tuli Block / Selebi-Phikwe)')),
-                      ],
+                      items: _selectedCountry.availableZones.map((z) {
+                        return DropdownMenuItem(value: z, child: Text('Lo$z'));
+                      }).toList(),
                       onChanged: (val) => setState(() => _selectedZone = val!),
                     ),
                     const SizedBox(height: 12),
+
+                    // Datum selector (dynamic per country)
                     DropdownButtonFormField<String>(
-                      value: _selectedDatum,
+                      value: datums.any((d) => d.key == _selectedDatum) ? _selectedDatum : datums.first.key,
                       decoration: const InputDecoration(labelText: 'Survey Datum', border: OutlineInputBorder()),
-                      items: const [
-                        DropdownMenuItem(value: 'cape', child: Text('Cape Datum (Legacy titles / Clarke 1880)')),
-                        DropdownMenuItem(value: 'wgs84', child: Text('WGS84 / BTRS02 (Modern Surveys)')),
-                      ],
+                      items: datums.map((d) {
+                        return DropdownMenuItem(value: d.key, child: Text(d.label));
+                      }).toList(),
                       onChanged: (val) => setState(() => _selectedDatum = val!),
                     ),
                   ],
@@ -386,8 +535,9 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
 class PlotMapScreen extends StatefulWidget {
   final List<ll.LatLng> points;
   final int zone;
+  final String datumKey;
 
-  const PlotMapScreen({super.key, required this.points, required this.zone});
+  const PlotMapScreen({super.key, required this.points, required this.zone, required this.datumKey});
 
   @override
   State<PlotMapScreen> createState() => _PlotMapScreenState();
@@ -438,6 +588,53 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
       appBar: AppBar(
         title: const Text('Plot Boundary', style: TextStyle(color: Colors.white)),
         backgroundColor: const Color(0xFF0070BA),
+        actions: [
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.share, color: Colors.white),
+            tooltip: 'Export Coordinates',
+            onSelected: (choice) async {
+              if (widget.points.isEmpty) return;
+
+              if (choice == 'kml') {
+                final kmlData = PlotExporter.generateKml(widget.points);
+                await PlotExporter.shareFile(
+                  content: kmlData,
+                  fileName: 'plot_boundary.kml',
+                  mimeType: 'application/vnd.google-earth.kml+xml',
+                );
+              } else if (choice == 'gpx') {
+                final gpxData = PlotExporter.generateGpx(widget.points);
+                await PlotExporter.shareFile(
+                  content: gpxData,
+                  fileName: 'plot_boundary.gpx',
+                  mimeType: 'application/gpx+xml',
+                );
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'kml',
+                child: Row(
+                  children: [
+                    Icon(Icons.public, color: Color(0xFF0070BA)),
+                    SizedBox(width: 8),
+                    Text('Export to Google Earth (.KML)'),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'gpx',
+                child: Row(
+                  children: [
+                    Icon(Icons.gps_fixed, color: Color(0xFF0070BA)),
+                    SizedBox(width: 8),
+                    Text('Export to Garmin GPS (.GPX)'),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
       body: Stack(
         children: [
@@ -636,7 +833,7 @@ class _BushGuidanceScreenState extends State<BushGuidanceScreen> {
 
     const locationSettings = LocationSettings(
       accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 1, // trigger recalculation every 1 meter moved
+      distanceFilter: 1,
     );
 
     _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings).listen((Position position) {
@@ -664,7 +861,7 @@ class _BushGuidanceScreenState extends State<BushGuidanceScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${widget.startLabel} ➔${widget.endLabel}', style: const TextStyle(color: Colors.white)),
+        title: Text('${widget.startLabel} \u2794 ${widget.endLabel}', style: const TextStyle(color: Colors.white)),
         backgroundColor: const Color(0xFF0070BA),
       ),
       body: Center(
@@ -674,7 +871,7 @@ class _BushGuidanceScreenState extends State<BushGuidanceScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(
-                'Compass Cutline Bearing: ${_targetBearing.toStringAsFixed(0)}°',
+                'Compass Cutline Bearing: ${_targetBearing.toStringAsFixed(0)}\u00B0',
                 style: const TextStyle(fontSize: 20, color: Colors.grey, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 40),
