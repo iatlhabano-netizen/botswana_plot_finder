@@ -16,6 +16,8 @@ import 'area_audit.dart';
 import 'offline_tile_provider.dart';
 import 'plot_calculator.dart';
 import 'plot_exporter.dart';
+import 'license_service.dart';
+import 'license_screen.dart';
 import 'plot_manager.dart';
 
 // ==============================================================
@@ -203,6 +205,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextRecognizer _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
   bool _scanning = false;
   double? _declaredHa;
+  LicenseInfo _license = LicenseInfo.expired();
 
   // Feature 2: GPS stream
   StreamSubscription<Position>? _gpsSub;
@@ -216,6 +219,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _restore();
+    _loadLicense();
     _startGps();
   }
 
@@ -239,6 +243,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // --- Persistence ---
+  Future<void> _loadLicense() async {
+    final info = await LicenseService.load();
+    if (mounted) setState(() => _license = info);
+  }
+
   Future<void> _restore() async {
     final sp = await SharedPreferences.getInstance();
     _selectedZone = sp.getInt('zone') ?? 25;
@@ -496,7 +505,7 @@ class _HomeScreenState extends State<HomeScreen> {
         .map((c) => {'Y': c.westing!, 'X': c.southing!}).toList();
     Navigator.push(context, MaterialPageRoute(builder: (_) => PlotMapScreen(
       points: pts, loCorners: loCorners, zone: _selectedZone, datumKey: _selectedDatum, declaredHa: _declaredHa,
-      projectName: _activeProject?.name,
+      projectName: _activeProject?.name, license: _license,
     )));
   }
 
@@ -515,15 +524,50 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text(_activeProject?.name ?? 'Plot Finder', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         backgroundColor: const Color(0xFF0070BA),
         actions: [
-          IconButton(icon: const Icon(Icons.folder_open, color: Colors.white), tooltip: 'My Plots', onPressed: _showPlotManager),
+          IconButton(
+            icon: Icon(_license.isFieldUnlock ? Icons.verified : Icons.lock_open, color: Colors.white),
+            tooltip: 'License',
+            onPressed: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => const LicenseScreen()));
+              _loadLicense();
+            },
+          ),
+          IconButton(
+            icon: Badge(
+              isLabelVisible: !_license.isFieldUnlock,
+              label: const Text('Pro', style: TextStyle(fontSize: 8, color: Colors.white)),
+              backgroundColor: Colors.orange,
+              child: const Icon(Icons.folder_open, color: Colors.white),
+            ),
+            tooltip: _license.isFieldUnlock ? 'My Plots' : 'My Plots (Field Unlock)',
+            onPressed: _showPlotManager,
+          ),
           IconButton(icon: Icon(widget.isDark ? Icons.light_mode : Icons.dark_mode, color: Colors.white), tooltip: 'Toggle theme', onPressed: widget.onToggleTheme),
-          IconButton(icon: const Icon(Icons.camera_alt, color: Colors.white), tooltip: 'Scan Certificate', onPressed: _scanning ? null : _scanCertificate),
+          IconButton(
+            icon: const Icon(Icons.camera_alt, color: Colors.white),
+            tooltip: 'Scan Certificate',
+            onPressed: _scanning ? null : () async {
+              if (_license.isFieldUnlock) { _scanCertificate(); return; }
+              final go = await LicenseService.require(context, LicenseTier.fieldUnlock, 'Certificate Scanner');
+              if (go) _scanCertificate();
+            },
+          ),
         ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           // Feature 2: Live GPS Display
+          // License status row
+          if (_license.isActive && _license.tier != LicenseTier.free)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Row(children: [
+                Icon(_license.isPro ? Icons.workspace_premium : Icons.verified, color: _license.isPro ? Colors.amber : const Color(0xFF0070BA), size: 20),
+                const SizedBox(width: 6),
+                Text(_license.tier.label, style: TextStyle(fontWeight: FontWeight.bold, color: _license.isPro ? Colors.amber.shade800 : const Color(0xFF0070BA))),
+              ]),
+            ),
           if (_currentPos != null)
             Card(
               color: Theme.of(context).colorScheme.primaryContainer,
@@ -636,7 +680,9 @@ class PlotMapScreen extends StatefulWidget {
   final String datumKey;
   final double? declaredHa;
   final String? projectName;
-  const PlotMapScreen({super.key, required this.points, required this.loCorners, required this.zone, required this.datumKey, this.declaredHa, this.projectName});
+  final LicenseInfo license;
+  PlotMapScreen({super.key, required this.points, required this.loCorners, required this.zone, required this.datumKey, this.declaredHa, this.projectName, LicenseInfo? license})
+      : license = license ?? LicenseInfo.expired();
 
   @override
   State<PlotMapScreen> createState() => _PlotMapScreenState();
@@ -725,7 +771,8 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
             tooltip: _measureMode ? 'Exit measure' : 'Measure distance',
             onPressed: () => setState(() { _measureMode = !_measureMode; _measureA = null; _measureB = null; _measureDist = null; }),
           ),
-          // Feature 7: Export menu (KML, GPX, CSV, JSON)
+          // Feature 7: Export menu (KML, GPX, CSV, JSON) — gated
+          if (_license.isFieldUnlock)
           PopupMenuButton<String>(
             icon: const Icon(Icons.share, color: Colors.white), tooltip: 'Export',
             onSelected: (c) async {
@@ -824,8 +871,13 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
             const SizedBox(height: 8),
             SizedBox(width: double.infinity, child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-              onPressed: () {
+              onPressed: () async {
                 if (_routeStart == null || _routeEnd == null || _routeStart == _routeEnd) { _toast('Select two different corners.'); return; }
+                if (!widget._license.isFieldUnlock) {
+                  final go = await LicenseService.require(context, LicenseTier.fieldUnlock, 'Bush Navigation');
+                  if (!go) return;
+                }
+                if (!context.mounted) return;
                 Navigator.push(context, MaterialPageRoute(builder: (_) => BushGuidanceScreen(
                   startPoint: widget.points[_routeStart!], endPoint: widget.points[_routeEnd!],
                   startLabel: 'C${_routeStart!+1}', endLabel: 'C${_routeEnd!+1}')));
