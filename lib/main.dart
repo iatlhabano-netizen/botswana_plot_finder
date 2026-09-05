@@ -9,6 +9,7 @@ import 'package:latlong2/latlong.dart' as ll;
 import 'package:proj4dart/proj4dart.dart' as proj4;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:botswana_plot_finder/plot_exporter.dart';
+import 'package:botswana_plot_finder/plot_calculator.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -182,31 +183,71 @@ class LoConverter {
 }
 
 // -------------------------------------------------------------
-// Area Calculator (Shoelace formula in hectares)
+// Plot Summary Card (Area & Boundary from raw Lo meters)
 // -------------------------------------------------------------
-class PlotArea {
-  static double toHectares(List<ll.LatLng> points) {
-    if (points.length < 3) return 0.0;
+class PlotSummaryCard extends StatelessWidget {
+  final PlotCalculationResult summary;
 
-    double lat0 = points.map((p) => p.latitude).reduce((a, b) => a + b) / points.length;
-    double lon0 = points.map((p) => p.longitude).reduce((a, b) => a + b) / points.length;
+  const PlotSummaryCard({super.key, required this.summary});
 
-    const double mPerDegLat = 111132.0;
-    double mPerDegLon = 111132.0 * cos(lat0 * pi / 180);
-
-    double sum = 0.0;
-    for (int i = 0; i < points.length; i++) {
-      final p1 = points[i];
-      final p2 = points[(i + 1) % points.length];
-      final x1 = (p1.longitude - lon0) * mPerDegLon;
-      final y1 = (p1.latitude - lat0) * mPerDegLat;
-      final x2 = (p2.longitude - lon0) * mPerDegLon;
-      final y2 = (p2.latitude - lat0) * mPerDegLat;
-      sum += (x1 * y2 - x2 * y1);
-    }
-
-    double areaSqm = sum.abs() / 2.0;
-    return areaSqm / 10000.0;
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(14.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Total Land Area', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                    Text(
+                      '${summary.areaHectares.toStringAsFixed(2)} Ha',
+                      style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF0070BA)),
+                    ),
+                    Text('${summary.areaSqMeters.toStringAsFixed(0)} m\u00b2', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    const Text('Perimeter / Fence', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                    Text(
+                      '${summary.perimeterMeters.toStringAsFixed(1)} m',
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const Divider(height: 18),
+            const Text('Boundary Segments (Fence Lines):', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: summary.segments.map((s) {
+                return Chip(
+                  visualDensity: VisualDensity.compact,
+                  backgroundColor: Colors.grey.shade100,
+                  label: Text(
+                    'C${s.fromCorner} \u2794 C${s.toCorner}: ${s.lengthMeters.toStringAsFixed(1)}m',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -361,8 +402,21 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
     return points;
   }
 
+  List<Map<String, double>> _getRawLoCorners() {
+    List<Map<String, double>> lo = [];
+    for (var corner in _corners) {
+      final y = double.tryParse(corner.yController.text.trim());
+      final x = double.tryParse(corner.xController.text.trim());
+      if (y != null && x != null) {
+        lo.add({'Y': y, 'X': x});
+      }
+    }
+    return lo;
+  }
+
   void _openPlotMap() {
     final points = _getConvertedCoordinates();
+    final loCorners = _getRawLoCorners();
     if (points.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please provide valid coordinates first.')),
@@ -375,6 +429,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       MaterialPageRoute(
         builder: (context) => PlotMapScreen(
           points: points,
+          loCorners: loCorners,
           zone: _selectedZone,
           datumKey: _selectedDatum,
         ),
@@ -534,10 +589,17 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
 // -------------------------------------------------------------
 class PlotMapScreen extends StatefulWidget {
   final List<ll.LatLng> points;
+  final List<Map<String, double>> loCorners;
   final int zone;
   final String datumKey;
 
-  const PlotMapScreen({super.key, required this.points, required this.zone, required this.datumKey});
+  const PlotMapScreen({
+    super.key,
+    required this.points,
+    required this.loCorners,
+    required this.zone,
+    required this.datumKey,
+  });
 
   @override
   State<PlotMapScreen> createState() => _PlotMapScreenState();
@@ -582,7 +644,7 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
   @override
   Widget build(BuildContext context) {
     final center = widget.points.isNotEmpty ? widget.points.first : const ll.LatLng(-23.58, 25.72);
-    final areaHectares = PlotArea.toHectares(widget.points);
+    final summary = PlotCalculator.calculateFromLo(widget.loCorners);
 
     return Scaffold(
       appBar: AppBar(
@@ -709,19 +771,10 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
             ],
           ),
           Positioned(
-            top: 16,
-            left: 16,
-            child: Card(
-              elevation: 4,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Text(
-                  'Area: ${areaHectares.toStringAsFixed(3)} ha',
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                ),
-              ),
-            ),
+            top: 12,
+            left: 12,
+            right: 12,
+            child: PlotSummaryCard(summary: summary),
           ),
           Positioned(
             bottom: 16,
