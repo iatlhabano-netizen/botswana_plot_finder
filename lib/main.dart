@@ -8,8 +8,10 @@ import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:proj4dart/proj4dart.dart' as proj4;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:botswana_plot_finder/plot_exporter.dart';
 import 'package:botswana_plot_finder/plot_calculator.dart';
+import 'package:botswana_plot_finder/area_audit.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -61,6 +63,10 @@ class DatumOption {
 // Coordinate Engine (Multi-Country South-Oriented Lo Proj)
 // -------------------------------------------------------------
 class LoConverter {
+class LoConverter {
+  // Cache projections to prevent proj4dart crash on duplicate registration.
+  static final Map<String, proj4.Projection> _cache = {};
+
   static const List<CountrySystem> supportedCountries = [
     CountrySystem(
       id: 'BW',
@@ -132,53 +138,154 @@ class LoConverter {
     }
   }
 
-  static ll.LatLng toWgs84(
-    double yWesting,
-    double xSouthing, {
-    required int zone,
-    required String datumKey,
-  }) {
-    String projDef;
-
+  static String _definition(int zone, String datumKey) {
     switch (datumKey) {
-      // South Africa Modern (Hartebeesthoek94 matches WGS84)
+      // Modern WGS84-based datums (Hartebeesthoek94, BTRS02)
       case 'za_hart94':
       case 'bw_btrs02':
       case 'wgs84':
-        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +datum=WGS84 +units=m +no_defs';
-        break;
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
+            '+ellps=WGS84 +units=m +no_defs';
 
       // South Africa / Eswatini / Lesotho Legacy Cape Datum
       case 'za_cape':
       case 'sz_cape':
       case 'ls_cape':
-        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
-        break;
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
+            '+a=6378249.145 +rf=293.4663076563986 '
+            '+towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
 
-      // Namibia Schwarzeck (Bessel 1841 ellipsoid)
+      // Namibia Schwarzeck (Bessel 1841)
       case 'na_schwarzeck':
-        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
-        break;
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
+            '+ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
 
-      // Zimbabwe Arc 1950 Datum
+      // Zimbabwe Arc 1950
       case 'zw_arc1950':
-        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
-        break;
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
+            '+a=6378249.145 +rf=293.4663076563986 '
+            '+towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
 
-      // Botswana Legacy Cape Datum (Clarke 1880)
+      // Botswana Cape Datum — verified 3-param shift (DSM Botswana)
       case 'bw_cape':
       default:
-        projDef = '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +axis=wsu +ellps=clrk80 +towgs84=-160,-22,-302,0,0,0,0 +units=m +no_defs';
-        break;
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
+            '+a=6378249.145 +rf=293.4663076563986 '
+            '+towgs84=-87,-105,-189,0,0,0,0 +units=m +no_defs';
     }
+  }
 
-    final projSrc = proj4.Projection.add('LO_${zone}_$datumKey', projDef);
+  /// Lo (south-oriented Gauss Conform) → WGS84.
+  /// [westing] = surveyor's Y, [southing] = surveyor's X.
+  /// We avoid +axis=wsu (unreliable in proj4dart) and negate manually:
+  /// easting = -westing, northing = -southing.
+  static ll.LatLng toWgs84({
+    required double westing,
+    required double southing,
+    required int zone,
+    required String datumKey,
+  }) {
+    final key = 'LO${zone}_$datumKey';
+    final projSrc = _cache.putIfAbsent(key, () => proj4.Projection.add(key, _definition(zone, datumKey)));
     final projWgs84 = proj4.Projection.get('EPSG:4326')!;
 
-    final pt = proj4.Point(x: yWesting, y: xSouthing);
+    final pt = proj4.Point(x: -westing, y: -southing);
     final result = projSrc.transform(projWgs84, pt);
-
     return ll.LatLng(result.y, result.x);
+  }
+
+  /// Reverse: WGS84 → Lo coordinates (for verification).
+  static ({double westing, double southing}) fromWgs84(
+    ll.LatLng ll, {
+    required int zone,
+    required String datumKey,
+  }) {
+    final key = 'LO${zone}_$datumKey';
+    final projSrc = _cache.putIfAbsent(key, () => proj4.Projection.add(key, _definition(zone, datumKey)));
+    final projWgs84 = proj4.Projection.get('EPSG:4326')!;
+
+    final out = projWgs84.transform(
+      projSrc,
+      proj4.Point(x: ll.longitude, y: ll.latitude),
+    );
+    return (westing: -out.x, southing: -out.y);
+  }
+
+  /// Plausibility check for Botswana Lo coordinates.
+  static String? validateLo(double westing, double southing) {
+    if (southing < 1500000 || southing > 3200000) {
+      return 'X ≈ ${southing.toStringAsFixed(0)} is outside SADC range (~1.5M–3.2M). Check zone/datum.';
+    }
+    if (westing.abs() > 200000) {
+      return 'Y ≈ ${westing.toStringAsFixed(0)} is >200 km from the CM — check the Lo zone.';
+    }
+    return null;
+  }
+}
+
+// -------------------------------------------------------------
+// Plot Summary Card (Area & Boundary from raw Lo meters)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+// Area Audit Banner (mismatch warning)
+// -------------------------------------------------------------
+class AreaAuditBanner extends StatelessWidget {
+  final AreaVerificationResult audit;
+
+  const AreaAuditBanner({super.key, required this.audit});
+
+  @override
+  Widget build(BuildContext context) {
+    if (audit.statedHectares <= 0) return const SizedBox.shrink();
+
+    final isAlert = audit.isMismatch;
+    final bgColor = isAlert ? Colors.amber.shade50 : Colors.green.shade50;
+    final borderColor = isAlert ? Colors.orange.shade700 : Colors.green.shade700;
+    final iconColor = isAlert ? Colors.orange.shade800 : Colors.green.shade800;
+
+    return Container(
+      margin: const EdgeInsets.only(top: 6, bottom: 6),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor, width: 1.2),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            isAlert ? Icons.warning_amber_rounded : Icons.verified_user_outlined,
+            color: iconColor,
+            size: 24,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isAlert ? 'Area Mismatch Alert' : 'Certificate Boundary Verified',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: iconColor, fontSize: 13),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  audit.message,
+                  style: TextStyle(fontSize: 12, color: isAlert ? Colors.brown.shade900 : Colors.green.shade900),
+                ),
+                if (isAlert) ...[
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Tip: Verify corner numbers follow chronological order and coordinate signs (+/-) are correct.',
+                    style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.black54),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -319,6 +426,12 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
   final TextRecognizer _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
 
   @override
+  void initState() {
+    super.initState();
+    _restore();
+  }
+
+  @override
   void dispose() {
     _textRecognizer.close();
     for (var c in _corners) {
@@ -326,6 +439,45 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       c.xController.dispose();
     }
     super.dispose();
+  }
+
+  Future<void> _restore() async {
+    final sp = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _selectedZone = sp.getInt('zone') ?? _selectedZone;
+      final datumIdx = sp.getInt('datum');
+      if (datumIdx != null && datumIdx < _selectedCountry.availableZones.length) {
+        final datums = LoConverter.availableDatums(_selectedCountry.id);
+        final key = sp.getString('datumKey');
+        if (key != null && datums.any((d) => d.key == key)) {
+          _selectedDatum = key;
+        }
+      }
+      final rows = sp.getStringList('corners') ?? const <String>[];
+      if (rows.isEmpty) {
+        _corners.addAll([
+          CornerInput('-74283', '2609149'),
+          CornerInput('-74593', '2609153'),
+          CornerInput('-74589', '2609473'),
+          CornerInput('-74279', '2609469'),
+        ]);
+      } else {
+        for (final r in rows) {
+          final p = r.split('|');
+          if (p.length >= 2) _corners.add(CornerInput(p[0], p[1]));
+        }
+      }
+    });
+  }
+
+  Future<void> _persist() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setInt('zone', _selectedZone);
+    await sp.setString('datumKey', _selectedDatum);
+    await sp.setStringList('corners', [
+      for (final c in _corners) '${c.yController.text}|${c.xController.text}',
+    ]);
   }
 
   void _onCountryChanged(CountrySystem newCountry) {
@@ -336,12 +488,14 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
           : newCountry.availableZones.first;
       _selectedDatum = newCountry.defaultDatum;
     });
+    _persist();
   }
 
   void _addCorner() {
     setState(() {
       _corners.add(CornerInput('', ''));
     });
+    _persist();
   }
 
   void _removeCorner(int index) {
@@ -349,65 +503,159 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       setState(() {
         _corners.removeAt(index);
       });
+      _persist();
     }
   }
 
+  double? _declaredHa;
+  bool _scanning = false;
+
   Future<void> _scanCertificate() async {
-    final picker = ImagePicker();
     final source = await showModalBottomSheet<ImageSource>(
       context: context,
       builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.camera_alt),
-              title: const Text('Take Photo'),
-              onTap: () => Navigator.pop(ctx, ImageSource.camera),
-            ),
-            ListTile(
-              leading: const Icon(Icons.photo_library),
-              title: const Text('Choose from Gallery'),
-              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
-            ),
-          ],
-        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.photo_camera),
+            title: const Text('Photograph the certificate'),
+            onTap: () => Navigator.pop(ctx, ImageSource.camera),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('Choose from gallery'),
+            onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+          ),
+        ]),
       ),
     );
-    if (source == null) return;
+    if (source == null || !mounted) return;
 
-    final photo = await picker.pickImage(source: source);
-    if (photo == null) return;
+    setState(() => _scanning = true);
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(source: source, maxWidth: 2600);
+      if (picked == null) return;
 
-    final inputImage = InputImage.fromFilePath(photo.path);
-    final recognizedText = await _textRecognizer.processImage(inputImage);
+      final inputImage = InputImage.fromFilePath(picked.path);
+      final recognizedText = await _textRecognizer.processImage(inputImage);
 
-    String text = recognizedText.text.replaceAll(RegExp(r'[oO](?=\d)'), '0');
-    final regex = RegExp(
-      r'Y\s*[:=\s]*([+-]?\d{4,6}(?:\.\d+)?)\s*[,;\s]*X\s*[:=\s]*([+]?\d{6,8}(?:\.\d+)?)',
-      caseSensitive: false,
-    );
+      String text = recognizedText.text.replaceAll(RegExp(r'[oO](?=\d)'), '0');
 
-    final matches = regex.allMatches(text);
-    if (matches.isEmpty) {
+      // Match Y...X order
+      final regexYX = RegExp(
+        r'Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)',
+        caseSensitive: false,
+      );
+      // Match X...Y order (reversed certificate)
+      final regexXY = RegExp(
+        r'X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)',
+        caseSensitive: false,
+      );
+
+      final parsed = <({double westing, double southing})>[];
+      final spans = <(int, int)>[];
+
+      for (final m in regexYX.allMatches(text)) {
+        if (spans.any((s) => m.start < s.$2 && m.end > s.$1)) continue;
+        final yv = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
+        final xv = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
+        if (yv != null && xv != null) { parsed.add((westing: yv, southing: xv)); spans.add((m.start, m.end)); }
+      }
+      for (final m in regexXY.allMatches(text)) {
+        if (spans.any((s) => m.start < s.$2 && m.end > s.$1)) continue;
+        final xv = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
+        final yv = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
+        if (yv != null && xv != null) { parsed.add((westing: yv, southing: xv)); spans.add((m.start, m.end)); }
+      }
+
+      if (!mounted) return;
+      if (parsed.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No coordinate pairs recognised. Fill the frame, avoid glare, retry.')),
+        );
+        return;
+      }
+
+      // Auto-detect declared area from certificate text
+      final detectedHa = AreaAuditor.extractStatedArea(text);
+      if (detectedHa != null) setState(() => _declaredHa = detectedHa);
+
+      // Show review dialog — nothing is overwritten until user confirms
+      final action = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('${parsed.length} coordinate pair(s) found'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 240,
+            child: ListView.builder(
+              itemCount: parsed.length,
+              itemBuilder: (_, i) => ListTile(
+                dense: true,
+                leading: CircleAvatar(
+                  radius: 12,
+                  backgroundColor: const Color(0xFF0070BA),
+                  child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                ),
+                title: Text('Y ${parsed[i].westing.toStringAsFixed(0)}   X ${parsed[i].southing.toStringAsFixed(0)}'),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(ctx, 'append'), child: const Text('Append')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace all')),
+          ],
+        ),
+      );
+      if (action == null || action == 'cancel' || !mounted) return;
+
+      setState(() {
+        if (action == 'replace') {
+          for (final c in _corners) { c.yController.dispose(); c.xController.dispose(); }
+          _corners.clear();
+        }
+        for (final p in parsed) {
+          _corners.add(CornerInput(p.westing.toStringAsFixed(0), p.southing.toStringAsFixed(0)));
+        }
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${parsed.length} coordinate(s) loaded!')),
+      );
+
+      // If we detected a declared area, show audit result
+      if (detectedHa != null) {
+        final loCorners = _corners
+            .where((c) => c.yController.text.isNotEmpty && c.xController.text.isNotEmpty)
+            .map((c) => {'Y': double.parse(c.yController.text), 'X': double.parse(c.xController.text)})
+            .toList();
+        if (loCorners.length >= 3) {
+          final result = PlotCalculator.calculateFromLo(loCorners);
+          final audit = AreaAuditor.auditArea(
+            computedHectares: result.areaHectares,
+            statedHectares: detectedHa,
+          );
+          if (audit.isMismatch && mounted) {
+            showDialog(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text('Area Mismatch'),
+                content: Text(audit.message),
+                actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+              ),
+            );
+          }
+        }
+      }
+    } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No coordinate pairs recognized. Try adjusting photo lighting.')),
+          SnackBar(content: Text('Scan failed: $e')),
         );
       }
-      return;
-    }
-
-    setState(() {
-      _corners.clear();
-      for (final match in matches) {
-        _corners.add(CornerInput(match.group(1)!, match.group(2)!));
-      }
-    });
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Found and loaded ${matches.length} coordinates!')),
-      );
+    } finally {
+      if (mounted) setState(() => _scanning = false);
     }
   }
 
@@ -417,7 +665,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       final y = double.tryParse(corner.yController.text.trim());
       final x = double.tryParse(corner.xController.text.trim());
       if (y != null && x != null) {
-        points.add(LoConverter.toWgs84(y, x, zone: _selectedZone, datumKey: _selectedDatum));
+        points.add(LoConverter.toWgs84(westing: y, southing: x, zone: _selectedZone, datumKey: _selectedDatum));
       }
     }
     return points;
@@ -453,6 +701,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
           loCorners: loCorners,
           zone: _selectedZone,
           datumKey: _selectedDatum,
+          declaredHa: _declaredHa,
         ),
       ),
     );
@@ -613,6 +862,7 @@ class PlotMapScreen extends StatefulWidget {
   final List<Map<String, double>> loCorners;
   final int zone;
   final String datumKey;
+  final double? declaredHa;
 
   const PlotMapScreen({
     super.key,
@@ -620,6 +870,7 @@ class PlotMapScreen extends StatefulWidget {
     required this.loCorners,
     required this.zone,
     required this.datumKey,
+    this.declaredHa,
   });
 
   @override
@@ -732,6 +983,10 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.example.botswana_plot_finder',
               ),
+                            SimpleAttributionWidget(
+                source: const Text('OpenStreetMap contributors'),
+                onTap: () => launchUrl(Uri.parse('https://openstreetmap.org/copyright')),
+              ),
               if (widget.points.length >= 3)
                 PolygonLayer(
                   polygons: [
@@ -795,7 +1050,19 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
             top: 12,
             left: 12,
             right: 12,
-            child: PlotSummaryCard(summary: summary),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                PlotSummaryCard(summary: summary),
+                if (widget.declaredHa != null)
+                  AreaAuditBanner(
+                    audit: AreaAuditor.auditArea(
+                      computedHectares: summary.areaHectares,
+                      statedHectares: widget.declaredHa!,
+                    ),
+                  ),
+              ],
+            ),
           ),
           Positioned(
             bottom: 16,
