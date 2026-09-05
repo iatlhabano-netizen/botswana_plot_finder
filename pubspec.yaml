@@ -1,7 +1,7 @@
 name: botswana_plot_finder
 description: SADC Multi-Country Lo Coordinate Converter, Certificate OCR, and Bush Navigator
 publish_to: 'none'
-version: 2.3.0+1
+version: 2.4.0+1
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
