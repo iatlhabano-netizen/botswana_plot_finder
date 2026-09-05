@@ -1,916 +1,712 @@
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:proj4dart/proj4dart.dart' as proj4;
-import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:botswana_plot_finder/plot_exporter.dart';
-import 'package:botswana_plot_finder/plot_calculator.dart';
-import 'package:botswana_plot_finder/area_audit.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const BotswanaPlotFinderApp());
+import 'area_audit.dart';
+import 'offline_tile_provider.dart';
+import 'plot_calculator.dart';
+import 'plot_exporter.dart';
+import 'plot_manager.dart';
+
+// ==============================================================
+// App
+// ==============================================================
+void main() => WidgetsFlutterBinding.ensureInitialized().then((_) => runApp(const PlotFinderApp()));
+
+class PlotFinderApp extends StatefulWidget {
+  const PlotFinderApp({super.key});
+  @override
+  State<PlotFinderApp> createState() => _PlotFinderAppState();
 }
 
-class BotswanaPlotFinderApp extends StatelessWidget {
-  const BotswanaPlotFinderApp({super.key});
+class _PlotFinderAppState extends State<PlotFinderApp> {
+  ThemeMode _themeMode = ThemeMode.light;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTheme();
+  }
+
+  Future<void> _loadTheme() async {
+    final sp = await SharedPreferences.getInstance();
+    final dark = sp.getBool('darkMode') ?? false;
+    setState(() => _themeMode = dark ? ThemeMode.dark : ThemeMode.light);
+  }
+
+  void _toggleTheme() async {
+    final sp = await SharedPreferences.getInstance();
+    final isDark = _themeMode == ThemeMode.dark;
+    await sp.setBool('darkMode', !isDark);
+    setState(() => _themeMode = isDark ? ThemeMode.light : ThemeMode.dark);
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Botswana Plot Finder',
+      title: 'Plot Finder',
       debugShowCheckedModeBanner: false,
+      themeMode: _themeMode,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF0070BA)),
         useMaterial3: true,
+        brightness: Brightness.light,
       ),
-      home: const MainHomeScreen(),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF0070BA),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+        brightness: Brightness.dark,
+      ),
+      home: HomeScreen(onToggleTheme: _toggleTheme, isDark: _themeMode == ThemeMode.dark),
     );
   }
 }
 
-// -------------------------------------------------------------
-// Country / Datum Presets
-// -------------------------------------------------------------
+// ==============================================================
+// LoConverter (cached projections, south-orientation via negate)
+// ==============================================================
 class CountrySystem {
   final String id;
   final String label;
   final List<int> availableZones;
   final String defaultDatum;
-
-  const CountrySystem({
-    required this.id,
-    required this.label,
-    required this.availableZones,
-    required this.defaultDatum,
-  });
+  const CountrySystem({required this.id, required this.label, required this.availableZones, required this.defaultDatum});
 }
 
 class DatumOption {
   final String key;
   final String label;
-
   const DatumOption({required this.key, required this.label});
 }
 
-// -------------------------------------------------------------
-// Coordinate Engine (Multi-Country South-Oriented Lo Proj)
-// -------------------------------------------------------------
 class LoConverter {
-class LoConverter {
-  // Cache projections to prevent proj4dart crash on duplicate registration.
   static final Map<String, proj4.Projection> _cache = {};
 
   static const List<CountrySystem> supportedCountries = [
-    CountrySystem(
-      id: 'BW',
-      label: 'Botswana',
-      availableZones: [21, 23, 25, 27, 29],
-      defaultDatum: 'bw_cape',
-    ),
-    CountrySystem(
-      id: 'ZA',
-      label: 'South Africa',
-      availableZones: [17, 19, 21, 23, 25, 27, 29, 31, 33],
-      defaultDatum: 'za_hart94',
-    ),
-    CountrySystem(
-      id: 'NA',
-      label: 'Namibia',
-      availableZones: [11, 13, 15, 17, 19],
-      defaultDatum: 'na_schwarzeck',
-    ),
-    CountrySystem(
-      id: 'ZW',
-      label: 'Zimbabwe',
-      availableZones: [27, 29, 31, 33],
-      defaultDatum: 'zw_arc1950',
-    ),
-    CountrySystem(
-      id: 'SZ',
-      label: 'Eswatini',
-      availableZones: [31],
-      defaultDatum: 'sz_cape',
-    ),
-    CountrySystem(
-      id: 'LS',
-      label: 'Lesotho',
-      availableZones: [27, 29],
-      defaultDatum: 'ls_cape',
-    ),
+    CountrySystem(id: 'BW', label: 'Botswana', availableZones: [21, 23, 25, 27, 29], defaultDatum: 'bw_cape'),
+    CountrySystem(id: 'ZA', label: 'South Africa', availableZones: [17, 19, 21, 23, 25, 27, 29, 31, 33], defaultDatum: 'za_hart94'),
+    CountrySystem(id: 'NA', label: 'Namibia', availableZones: [11, 13, 15, 17, 19], defaultDatum: 'na_schwarzeck'),
+    CountrySystem(id: 'ZW', label: 'Zimbabwe', availableZones: [27, 29, 31, 33], defaultDatum: 'zw_arc1950'),
+    CountrySystem(id: 'SZ', label: 'Eswatini', availableZones: [31], defaultDatum: 'sz_cape'),
+    CountrySystem(id: 'LS', label: 'Lesotho', availableZones: [27, 29], defaultDatum: 'ls_cape'),
   ];
 
   static List<DatumOption> availableDatums(String countryCode) {
     switch (countryCode) {
-      case 'ZA':
-        return const [
-          DatumOption(key: 'za_hart94', label: 'Hartebeesthoek94 (Modern / WGS84)'),
-          DatumOption(key: 'za_cape', label: 'Cape Datum (Legacy / Clarke 1880)'),
-        ];
-      case 'NA':
-        return const [
-          DatumOption(key: 'na_schwarzeck', label: 'Schwarzeck (Bessel 1841)'),
-        ];
-      case 'ZW':
-        return const [
-          DatumOption(key: 'zw_arc1950', label: 'Arc 1950 (Clarke 1880 Modified)'),
-        ];
-      case 'SZ':
-        return const [
-          DatumOption(key: 'sz_cape', label: 'Cape Datum (Clarke 1880)'),
-        ];
-      case 'LS':
-        return const [
-          DatumOption(key: 'ls_cape', label: 'Cape Datum (Clarke 1880)'),
-        ];
-      case 'BW':
-      default:
-        return const [
-          DatumOption(key: 'bw_cape', label: 'Cape Datum (Legacy / Clarke 1880)'),
-          DatumOption(key: 'bw_btrs02', label: 'BTRS02 / Modern (WGS84)'),
-        ];
+      case 'ZA': return const [DatumOption(key: 'za_hart94', label: 'Hartebeesthoek94 (Modern)'), DatumOption(key: 'za_cape', label: 'Cape Datum (Legacy)')];
+      case 'NA': return const [DatumOption(key: 'na_schwarzeck', label: 'Schwarzeck (Bessel 1841)')];
+      case 'ZW': return const [DatumOption(key: 'zw_arc1950', label: 'Arc 1950')];
+      case 'SZ': return const [DatumOption(key: 'sz_cape', label: 'Cape Datum')];
+      case 'LS': return const [DatumOption(key: 'ls_cape', label: 'Cape Datum')];
+      default: return const [DatumOption(key: 'bw_cape', label: 'Cape Datum'), DatumOption(key: 'bw_btrs02', label: 'BTRS02 / WGS84')];
     }
   }
 
-  static String _definition(int zone, String datumKey) {
-    switch (datumKey) {
-      // Modern WGS84-based datums (Hartebeesthoek94, BTRS02)
-      case 'za_hart94':
-      case 'bw_btrs02':
-      case 'wgs84':
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
-            '+ellps=WGS84 +units=m +no_defs';
-
-      // South Africa / Eswatini / Lesotho Legacy Cape Datum
-      case 'za_cape':
-      case 'sz_cape':
-      case 'ls_cape':
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
-            '+a=6378249.145 +rf=293.4663076563986 '
-            '+towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
-
-      // Namibia Schwarzeck (Bessel 1841)
+  static String _def(int zone, String dk) {
+    switch (dk) {
+      case 'za_hart94': case 'bw_btrs02': case 'wgs84':
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs';
+      case 'za_cape': case 'sz_cape': case 'ls_cape':
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
       case 'na_schwarzeck':
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
-            '+ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
-
-      // Zimbabwe Arc 1950
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
       case 'zw_arc1950':
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
-            '+a=6378249.145 +rf=293.4663076563986 '
-            '+towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
-
-      // Botswana Cape Datum — verified 3-param shift (DSM Botswana)
-      case 'bw_cape':
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
       default:
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 '
-            '+a=6378249.145 +rf=293.4663076563986 '
-            '+towgs84=-87,-105,-189,0,0,0,0 +units=m +no_defs';
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-87,-105,-189,0,0,0,0 +units=m +no_defs';
     }
   }
 
-  /// Lo (south-oriented Gauss Conform) → WGS84.
-  /// [westing] = surveyor's Y, [southing] = surveyor's X.
-  /// We avoid +axis=wsu (unreliable in proj4dart) and negate manually:
-  /// easting = -westing, northing = -southing.
-  static ll.LatLng toWgs84({
-    required double westing,
-    required double southing,
-    required int zone,
-    required String datumKey,
-  }) {
-    final key = 'LO${zone}_$datumKey';
-    final projSrc = _cache.putIfAbsent(key, () => proj4.Projection.add(key, _definition(zone, datumKey)));
-    final projWgs84 = proj4.Projection.get('EPSG:4326')!;
-
-    final pt = proj4.Point(x: -westing, y: -southing);
-    final result = projSrc.transform(projWgs84, pt);
-    return ll.LatLng(result.y, result.x);
+  static ll.LatLng toWgs84({required double westing, required double southing, required int zone, required String datumKey}) {
+    final k = 'LO${zone}_$datumKey';
+    final src = _cache.putIfAbsent(k, () => proj4.Projection.add(k, _def(zone, datumKey)));
+    final out = src.transform(proj4.Projection.get('EPSG:4326')!, proj4.Point(x: -westing, y: -southing));
+    return ll.LatLng(out.y, out.x);
   }
 
-  /// Reverse: WGS84 → Lo coordinates (for verification).
-  static ({double westing, double southing}) fromWgs84(
-    ll.LatLng ll, {
-    required int zone,
-    required String datumKey,
-  }) {
-    final key = 'LO${zone}_$datumKey';
-    final projSrc = _cache.putIfAbsent(key, () => proj4.Projection.add(key, _definition(zone, datumKey)));
-    final projWgs84 = proj4.Projection.get('EPSG:4326')!;
-
-    final out = projWgs84.transform(
-      projSrc,
-      proj4.Point(x: ll.longitude, y: ll.latitude),
-    );
+  static ({double westing, double southing}) fromWgs84(ll.LatLng ll, {required int zone, required String datumKey}) {
+    final k = 'LO${zone}_$datumKey';
+    final src = _cache.putIfAbsent(k, () => proj4.Projection.add(k, _def(zone, datumKey)));
+    final out = proj4.Projection.get('EPSG:4326')!.transform(src, proj4.Point(x: ll.longitude, y: ll.latitude));
     return (westing: -out.x, southing: -out.y);
   }
 
-  /// Plausibility check for Botswana Lo coordinates.
   static String? validateLo(double westing, double southing) {
-    if (southing < 1500000 || southing > 3200000) {
-      return 'X ≈ ${southing.toStringAsFixed(0)} is outside SADC range (~1.5M–3.2M). Check zone/datum.';
-    }
-    if (westing.abs() > 200000) {
-      return 'Y ≈ ${westing.toStringAsFixed(0)} is >200 km from the CM — check the Lo zone.';
-    }
+    if (southing < 1500000 || southing > 3200000) return 'X outside SADC range. Check zone/datum.';
+    if (westing.abs() > 200000) return 'Y >200 km from CM — check Lo zone.';
     return null;
   }
 }
 
-// -------------------------------------------------------------
-// Plot Summary Card (Area & Boundary from raw Lo meters)
-// -------------------------------------------------------------
-// -------------------------------------------------------------
-// Area Audit Banner (mismatch warning)
-// -------------------------------------------------------------
-class AreaAuditBanner extends StatelessWidget {
-  final AreaVerificationResult audit;
-
-  const AreaAuditBanner({super.key, required this.audit});
-
-  @override
-  Widget build(BuildContext context) {
-    if (audit.statedHectares <= 0) return const SizedBox.shrink();
-
-    final isAlert = audit.isMismatch;
-    final bgColor = isAlert ? Colors.amber.shade50 : Colors.green.shade50;
-    final borderColor = isAlert ? Colors.orange.shade700 : Colors.green.shade700;
-    final iconColor = isAlert ? Colors.orange.shade800 : Colors.green.shade800;
-
-    return Container(
-      margin: const EdgeInsets.only(top: 6, bottom: 6),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: borderColor, width: 1.2),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(
-            isAlert ? Icons.warning_amber_rounded : Icons.verified_user_outlined,
-            color: iconColor,
-            size: 24,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  isAlert ? 'Area Mismatch Alert' : 'Certificate Boundary Verified',
-                  style: TextStyle(fontWeight: FontWeight.bold, color: iconColor, fontSize: 13),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  audit.message,
-                  style: TextStyle(fontSize: 12, color: isAlert ? Colors.brown.shade900 : Colors.green.shade900),
-                ),
-                if (isAlert) ...[
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Tip: Verify corner numbers follow chronological order and coordinate signs (+/-) are correct.',
-                    style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.black54),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// -------------------------------------------------------------
-// Plot Summary Card (Area & Boundary from raw Lo meters)
-// -------------------------------------------------------------
-class PlotSummaryCard extends StatelessWidget {
-  final PlotCalculationResult summary;
-
-  const PlotSummaryCard({super.key, required this.summary});
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(14.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Total Land Area', style: TextStyle(fontSize: 12, color: Colors.grey)),
-                    Text(
-                      '${summary.areaHectares.toStringAsFixed(2)} Ha',
-                      style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF0070BA)),
-                    ),
-                    Text('${summary.areaSqMeters.toStringAsFixed(0)} m\u00b2', style: const TextStyle(fontSize: 12)),
-                  ],
-                ),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    const Text('Perimeter / Fence', style: TextStyle(fontSize: 12, color: Colors.grey)),
-                    Text(
-                      '${summary.perimeterMeters.toStringAsFixed(1)} m',
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-            const Divider(height: 18),
-            const Text('Boundary Segments (Fence Lines):', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              children: summary.segments.map((s) {
-                return Chip(
-                  visualDensity: VisualDensity.compact,
-                  backgroundColor: Colors.grey.shade100,
-                  label: Text(
-                    'C${s.fromCorner} \u2794 C${s.toCorner}: ${s.lengthMeters.toStringAsFixed(1)}m',
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                );
-              }).toList(),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// -------------------------------------------------------------
-// Bush Navigator (Cross Track Error Math)
-// -------------------------------------------------------------
+// ==============================================================
+// BushNavigator (Cross Track Error + Along Track)
+// ==============================================================
 class BushNavigator {
-  static const double earthRadius = 6371000.0;
+  static const double R = 6371000.0;
+  static const Distance _d = Distance();
 
-  static double getCrossTrackError(ll.LatLng current, ll.LatLng start, ll.LatLng end) {
-    double d13 = _distance(start, current) / earthRadius;
-    double theta13 = _bearing(start, current);
-    double theta12 = _bearing(start, end);
-    return asin(sin(d13) * sin(theta13 - theta12)) * earthRadius;
+  static double distanceM(ll.LatLng a, ll.LatLng b) => _d.as(ll.LengthUnit.Meter, a, b);
+
+  static double _brg(ll.LatLng a, ll.LatLng b) {
+    final la = a.latitude * pi / 180, lb = b.latitude * pi / 180;
+    final dl = (b.longitude - a.longitude) * pi / 180;
+    return atan2(sin(dl) * cos(lb), cos(la) * sin(lb) - sin(la) * cos(lb) * cos(dl));
   }
 
-  static double getDistanceRemaining(ll.LatLng current, ll.LatLng end) {
-    return _distance(current, end);
+  static double bearingDeg(ll.LatLng a, ll.LatLng b) => (_brg(a, b) * 180 / pi + 360) % 360;
+
+  static double crossTrack(ll.LatLng cur, ll.LatLng start, ll.LatLng end) {
+    final d13 = distanceM(start, cur) / R;
+    return asin(sin(d13) * sin(_brg(start, cur) - _brg(start, end))) * R;
   }
 
-  static double getTargetBearing(ll.LatLng start, ll.LatLng end) {
-    return (_bearing(start, end) * 180 / pi + 360) % 360;
-  }
-
-  static double _bearing(ll.LatLng p1, ll.LatLng p2) {
-    double lat1 = p1.latitude * pi / 180;
-    double lat2 = p2.latitude * pi / 180;
-    double dLon = (p2.longitude - p1.longitude) * pi / 180;
-    double y = sin(dLon) * cos(lat2);
-    double x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
-    return atan2(y, x);
-  }
-
-  static double _distance(ll.LatLng p1, ll.LatLng p2) {
-    const distanceCalc = ll.Distance();
-    return distanceCalc.as(ll.LengthUnit.Meter, p1, p2);
+  /// Signed along-track: negative = target is behind you (overshoot).
+  static double alongTrack(ll.LatLng cur, ll.LatLng start, ll.LatLng end) {
+    final d13 = distanceM(start, cur) / R;
+    final d12 = distanceM(start, end) / R;
+    final t = _brg(start, cur) - _brg(start, end);
+    final cosA = (cos(d13) * cos(d12) + sin(d13) * sin(d12) * cos(t)).clamp(-1.0, 1.0);
+    final mag = acos(cosA) * R;
+    return cos(t) >= 0 ? mag : -mag;
   }
 }
 
-// -------------------------------------------------------------
-// Main Screen: Coordinates, OCR & Plot Overview
-// -------------------------------------------------------------
-class CornerInput {
-  TextEditingController yController;
-  TextEditingController xController;
-  CornerInput(String y, String x)
-      : yController = TextEditingController(text: y),
-        xController = TextEditingController(text: x);
-}
-
-class MainHomeScreen extends StatefulWidget {
-  const MainHomeScreen({super.key});
-
+// ==============================================================
+// Home Screen (Feature 2: GPS Lo display, Feature 4: Multi-plot, Feature 8: Dark mode toggle)
+// ==============================================================
+class HomeScreen extends StatefulWidget {
+  final VoidCallback onToggleTheme;
+  final bool isDark;
+  const HomeScreen({super.key, required this.onToggleTheme, required this.isDark});
   @override
-  State<MainHomeScreen> createState() => _MainHomeScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _MainHomeScreenState extends State<MainHomeScreen> {
-  CountrySystem _selectedCountry = LoConverter.supportedCountries[0]; // Botswana
+class _HomeScreenState extends State<HomeScreen> {
+  CountrySystem _selectedCountry = LoConverter.supportedCountries[0];
   int _selectedZone = 25;
   String _selectedDatum = 'bw_cape';
-  final List<CornerInput> _corners = [
-    CornerInput('-74283', '2609149'),
-    CornerInput('-74593', '2609153'),
-    CornerInput('-74589', '2609473'),
-    CornerInput('-74279', '2609469'),
-  ];
-
+  final List<CornerInput> _corners = [];
   final TextRecognizer _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
+  bool _scanning = false;
+  double? _declaredHa;
+
+  // Feature 2: GPS stream
+  StreamSubscription<Position>? _gpsSub;
+  ll.LatLng? _currentPos;
+
+  // Feature 4: Multi-plot
+  List<PlotProject> _projects = [];
+  PlotProject? _activeProject;
 
   @override
   void initState() {
     super.initState();
     _restore();
+    _startGps();
   }
 
   @override
   void dispose() {
     _textRecognizer.close();
-    for (var c in _corners) {
-      c.yController.dispose();
-      c.xController.dispose();
-    }
+    _gpsSub?.cancel();
+    for (var c in _corners) { c.yController.dispose(); c.xController.dispose(); }
     super.dispose();
   }
 
+  // --- GPS (Feature 2) ---
+  void _startGps() async {
+    if (!await Geolocator.isLocationServiceEnabled()) return;
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
+    _gpsSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 10),
+    ).listen((pos) => setState(() => _currentPos = ll.LatLng(pos.latitude, pos.longitude)));
+  }
+
+  // --- Persistence ---
   Future<void> _restore() async {
     final sp = await SharedPreferences.getInstance();
-    if (!mounted) return;
-    setState(() {
-      _selectedZone = sp.getInt('zone') ?? _selectedZone;
-      final datumIdx = sp.getInt('datum');
-      if (datumIdx != null && datumIdx < _selectedCountry.availableZones.length) {
-        final datums = LoConverter.availableDatums(_selectedCountry.id);
-        final key = sp.getString('datumKey');
-        if (key != null && datums.any((d) => d.key == key)) {
-          _selectedDatum = key;
-        }
+    _selectedZone = sp.getInt('zone') ?? 25;
+    _selectedDatum = sp.getString('datumKey') ?? 'bw_cape';
+    _declaredHa = sp.getDouble('declaredHa');
+
+    // Load projects (Feature 4)
+    _projects = await PlotManager.loadAll();
+    final activeId = await PlotManager.activeId();
+    _activeProject = _projects.where((p) => p.id == activeId).firstOrNull;
+
+    if (_activeProject != null) {
+      _corners.clear();
+      for (final c in _activeProject!.corners) {
+        _corners.add(CornerInput(c['y'] ?? '', c['x'] ?? '');
       }
-      final rows = sp.getStringList('corners') ?? const <String>[];
-      if (rows.isEmpty) {
-        _corners.addAll([
-          CornerInput('-74283', '2609149'),
-          CornerInput('-74593', '2609153'),
-          CornerInput('-74589', '2609473'),
-          CornerInput('-74279', '2609469'),
-        ]);
-      } else {
-        for (final r in rows) {
-          final p = r.split('|');
-          if (p.length >= 2) _corners.add(CornerInput(p[0], p[1]));
-        }
-      }
-    });
+      final zoneInt = int.tryParse(_activeProject!.zone);
+      if (zoneInt != null) _selectedZone = zoneInt;
+      _selectedDatum = _activeProject!.datumKey;
+    } else if (_corners.isEmpty) {
+      _corners.addAll([
+        CornerInput('-74283', '2609149'), CornerInput('-74593', '2609153'),
+        CornerInput('-74589', '2609473'), CornerInput('-74279', '2609469'),
+      ]);
+    }
+    setState(() {});
   }
 
   Future<void> _persist() async {
     final sp = await SharedPreferences.getInstance();
     await sp.setInt('zone', _selectedZone);
     await sp.setString('datumKey', _selectedDatum);
-    await sp.setStringList('corners', [
-      for (final c in _corners) '${c.yController.text}|${c.xController.text}',
-    ]);
-  }
+    if (_declaredHa != null) await sp.setDouble('declaredHa', _declaredHa!);
 
-  void _onCountryChanged(CountrySystem newCountry) {
-    setState(() {
-      _selectedCountry = newCountry;
-      _selectedZone = newCountry.availableZones.contains(_selectedZone)
-          ? _selectedZone
-          : newCountry.availableZones.first;
-      _selectedDatum = newCountry.defaultDatum;
-    });
-    _persist();
-  }
-
-  void _addCorner() {
-    setState(() {
-      _corners.add(CornerInput('', ''));
-    });
-    _persist();
-  }
-
-  void _removeCorner(int index) {
-    if (_corners.length > 1) {
-      setState(() {
-        _corners.removeAt(index);
-      });
-      _persist();
+    // Persist active project (Feature 4)
+    if (_activeProject != null) {
+      _activeProject!.zone = _selectedZone.toString();
+      _activeProject!.datumKey = _selectedDatum;
+      _activeProject!.corners.clear();
+      for (final c in _corners) {
+        _activeProject!.corners.add({'y': c.yController.text, 'x': c.xController.text});
+      }
+      await PlotManager.saveAll(_projects);
+    } else {
+      await sp.setStringList('corners', [for (final c in _corners) '${c.yController.text}|${c.xController.text}']);
     }
   }
 
-  double? _declaredHa;
-  bool _scanning = false;
+  void _onCountryChanged(CountrySystem c) {
+    setState(() {
+      _selectedCountry = c;
+      _selectedZone = c.availableZones.contains(_selectedZone) ? _selectedZone : c.availableZones.first;
+      _selectedDatum = c.defaultDatum;
+    });
+    _persist();
+  }
 
+  void _addCorner() { setState(() => _corners.add(CornerInput('', ''))); _persist(); }
+  void _removeCorner(int i) {
+    if (_corners.length > 1) { setState(() => _corners.removeAt(i)); _persist(); }
+  }
+
+  // --- Multi-plot management (Feature 4) ---
+  void _showPlotManager() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6, maxChildSize: 0.9, minChildSize: 0.3,
+        expand: false,
+        builder: (_, scroll) => Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('My Plots', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  IconButton(
+                    icon: const Icon(Icons.add_circle, color: Color(0xFF0070BA), size: 30),
+                    onPressed: () { Navigator.pop(ctx); _createNewPlot(); },
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: _projects.isEmpty
+                  ? const Center(child: Text('No saved plots yet.\nTap + to create one.', textAlign: TextAlign.center))
+                  : ListView.builder(
+                      controller: scroll,
+                      itemCount: _projects.length,
+                      itemBuilder: (_, i) {
+                        final p = _projects[i];
+                        final isActive = p.id == _activeProject?.id;
+                        return ListTile(
+                          leading: Icon(Icons.map, color: isActive ? const Color(0xFF0070BA) : Colors.grey),
+                          title: Text(p.name, style: TextStyle(fontWeight: isActive ? FontWeight.bold : FontWeight.normal)),
+                          subtitle: Text('${p.corners.length} corners · Lo${p.zone}'),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isActive) const Icon(Icons.check_circle, color: Color(0xFF0070BA), size: 20),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline, size: 20),
+                                onPressed: () => _deletePlot(p),
+                              ),
+                            ],
+                          ),
+                          onTap: () { Navigator.pop(ctx); _loadPlot(p); },
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _createNewPlot() async {
+    final nameCtrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('New Plot'),
+        content: TextField(controller: nameCtrl, decoration: const InputDecoration(hintText: 'e.g. Farm 4273, Phakalane 12', border: OutlineInputBorder())),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, nameCtrl.text), child: const Text('Create')),
+        ],
+      ),
+    );
+    if (name == null || name.trim().isEmpty) return;
+
+    // Save current corners first
+    await _persist();
+
+    final project = PlotProject(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name.trim(),
+      zone: _selectedZone.toString(),
+      datumKey: _selectedDatum,
+      corners: [for (final c in _corners) {'y': c.yController.text, 'x': c.xController.text}],
+    );
+    _projects.add(project);
+    _activeProject = project;
+    await PlotManager.saveAll(_projects);
+    await PlotManager.setActive(project.id);
+    setState(() {});
+    _toast('Plot "${project.name}" created');
+  }
+
+  void _loadPlot(PlotProject p) async {
+    await _persist(); // save current first
+    _activeProject = p;
+    await PlotManager.setActive(p.id);
+    setState(() {
+      _corners.clear();
+      for (final c in p.corners) { _corners.add(CornerInput(c['y'] ?? '', c['x'] ?? '')); }
+      _selectedZone = int.tryParse(p.zone) ?? 25;
+      _selectedDatum = p.datumKey;
+    });
+  }
+
+  void _deletePlot(PlotProject p) async {
+    _projects.remove(p);
+    if (_activeProject?.id == p.id) { _activeProject = null; await PlotManager.setActive(''); }
+    await PlotManager.saveAll(_projects);
+    setState(() {});
+    _toast('Deleted "${p.name}"');
+  }
+
+  void _toast(String m) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m))); }
+
+  // --- OCR (Feature 3: review dialog, gallery + camera) ---
   Future<void> _scanCertificate() async {
     final source = await showModalBottomSheet<ImageSource>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(
-            leading: const Icon(Icons.photo_camera),
-            title: const Text('Photograph the certificate'),
-            onTap: () => Navigator.pop(ctx, ImageSource.camera),
-          ),
-          ListTile(
-            leading: const Icon(Icons.photo_library),
-            title: const Text('Choose from gallery'),
-            onTap: () => Navigator.pop(ctx, ImageSource.gallery),
-          ),
-        ]),
-      ),
+      builder: (ctx) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(leading: const Icon(Icons.photo_camera), title: const Text('Photograph the certificate'), onTap: () => Navigator.pop(ctx, ImageSource.camera)),
+        ListTile(leading: const Icon(Icons.photo_library), title: const Text('Choose from gallery'), onTap: () => Navigator.pop(ctx, ImageSource.gallery)),
+      ])),
     );
     if (source == null || !mounted) return;
 
     setState(() => _scanning = true);
     try {
-      final picker = ImagePicker();
-      final picked = await picker.pickImage(source: source, maxWidth: 2600);
-      if (picked == null) return;
+      final photo = await ImagePicker().pickImage(source: source, maxWidth: 2600);
+      if (photo == null) return;
+      final text = (await _textRecognizer.processImage(InputImage.fromFilePath(photo.path))).text;
+      String cleaned = text.replaceAll(RegExp(r'[oO](?=\d)'), '0');
 
-      final inputImage = InputImage.fromFilePath(picked.path);
-      final recognizedText = await _textRecognizer.processImage(inputImage);
+      final reYX = RegExp(r'Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)', caseSensitive: false);
+      final reXY = RegExp(r'X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)', caseSensitive: false);
 
-      String text = recognizedText.text.replaceAll(RegExp(r'[oO](?=\d)'), '0');
-
-      // Match Y...X order
-      final regexYX = RegExp(
-        r'Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)',
-        caseSensitive: false,
-      );
-      // Match X...Y order (reversed certificate)
-      final regexXY = RegExp(
-        r'X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)',
-        caseSensitive: false,
-      );
-
-      final parsed = <({double westing, double southing})>[];
+      final parsed = <({double w, double s})>[];
       final spans = <(int, int)>[];
-
-      for (final m in regexYX.allMatches(text)) {
-        if (spans.any((s) => m.start < s.$2 && m.end > s.$1)) continue;
-        final yv = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
-        final xv = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
-        if (yv != null && xv != null) { parsed.add((westing: yv, southing: xv)); spans.add((m.start, m.end)); }
+      for (final m in reYX.allMatches(cleaned)) {
+        if (spans.any((sp) => m.start < sp.$2 && m.end > sp.$1)) continue;
+        final w = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
+        final s = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
+        if (w != null && s != null) { parsed.add((w: w, s: s)); spans.add((m.start, m.end)); }
       }
-      for (final m in regexXY.allMatches(text)) {
-        if (spans.any((s) => m.start < s.$2 && m.end > s.$1)) continue;
-        final xv = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
-        final yv = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
-        if (yv != null && xv != null) { parsed.add((westing: yv, southing: xv)); spans.add((m.start, m.end)); }
+      for (final m in reXY.allMatches(cleaned)) {
+        if (spans.any((sp) => m.start < sp.$2 && m.end > sp.$1)) continue;
+        final s = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
+        final w = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
+        if (w != null && s != null) { parsed.add((w: w, s: s)); spans.add((m.start, m.end)); }
       }
 
       if (!mounted) return;
-      if (parsed.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No coordinate pairs recognised. Fill the frame, avoid glare, retry.')),
-        );
-        return;
-      }
+      if (parsed.isEmpty) { _toast('No coordinate pairs found. Retry with better lighting.'); return; }
 
-      // Auto-detect declared area from certificate text
-      final detectedHa = AreaAuditor.extractStatedArea(text);
-      if (detectedHa != null) setState(() => _declaredHa = detectedHa);
-
-      // Show review dialog — nothing is overwritten until user confirms
       final action = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: Text('${parsed.length} coordinate pair(s) found'),
-          content: SizedBox(
-            width: double.maxFinite,
-            height: 240,
-            child: ListView.builder(
-              itemCount: parsed.length,
-              itemBuilder: (_, i) => ListTile(
-                dense: true,
-                leading: CircleAvatar(
-                  radius: 12,
-                  backgroundColor: const Color(0xFF0070BA),
-                  child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 11)),
-                ),
-                title: Text('Y ${parsed[i].westing.toStringAsFixed(0)}   X ${parsed[i].southing.toStringAsFixed(0)}'),
-              ),
-            ),
-          ),
+          title: Text('${parsed.length} coordinate(s) found'),
+          content: SizedBox(width: double.maxFinite, height: 200, child: ListView.builder(
+            itemCount: parsed.length,
+            itemBuilder: (_, i) => ListTile(dense: true,
+              leading: CircleAvatar(radius: 12, backgroundColor: const Color(0xFF0070BA), child: Text('${i+1}', style: const TextStyle(color: Colors.white, fontSize: 11))),
+              title: Text('Y ${parsed[i].w.toStringAsFixed(0)}   X ${parsed[i].s.toStringAsFixed(0)}')),
+          )),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
             TextButton(onPressed: () => Navigator.pop(ctx, 'append'), child: const Text('Append')),
-            FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace all')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace')),
           ],
         ),
       );
-      if (action == null || action == 'cancel' || !mounted) return;
+      if (action == null || !mounted) return;
 
       setState(() {
-        if (action == 'replace') {
-          for (final c in _corners) { c.yController.dispose(); c.xController.dispose(); }
-          _corners.clear();
-        }
-        for (final p in parsed) {
-          _corners.add(CornerInput(p.westing.toStringAsFixed(0), p.southing.toStringAsFixed(0)));
-        }
+        if (action == 'replace') { for (final c in _corners) { c.yController.dispose(); c.xController.dispose(); } _corners.clear(); }
+        for (final p in parsed) _corners.add(CornerInput(p.w.toStringAsFixed(0), p.s.toStringAsFixed(0)));
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${parsed.length} coordinate(s) loaded!')),
-      );
-
-      // If we detected a declared area, show audit result
-      if (detectedHa != null) {
-        final loCorners = _corners
-            .where((c) => c.yController.text.isNotEmpty && c.xController.text.isNotEmpty)
-            .map((c) => {'Y': double.parse(c.yController.text), 'X': double.parse(c.xController.text)})
-            .toList();
-        if (loCorners.length >= 3) {
-          final result = PlotCalculator.calculateFromLo(loCorners);
-          final audit = AreaAuditor.auditArea(
-            computedHectares: result.areaHectares,
-            statedHectares: detectedHa,
-          );
-          if (audit.isMismatch && mounted) {
-            showDialog(
-              context: context,
-              builder: (ctx) => AlertDialog(
-                title: const Text('Area Mismatch'),
-                content: Text(audit.message),
-                actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
-              ),
-            );
-          }
-        }
-      }
+      // Auto-detect declared area
+      final detectedHa = AreaAuditor.extractStatedArea(cleaned);
+      if (detectedHa != null) { setState(() => _declaredHa = detectedHa); _persist(); }
+      _toast('${parsed.length} coordinate(s) loaded!');
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Scan failed: $e')),
-        );
-      }
+      _toast('Scan failed: $e');
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
   }
 
-  List<ll.LatLng> _getConvertedCoordinates() {
-    List<ll.LatLng> points = [];
-    for (var corner in _corners) {
-      final y = double.tryParse(corner.yController.text.trim());
-      final x = double.tryParse(corner.xController.text.trim());
-      if (y != null && x != null) {
-        points.add(LoConverter.toWgs84(westing: y, southing: x, zone: _selectedZone, datumKey: _selectedDatum));
-      }
-    }
-    return points;
-  }
-
-  List<Map<String, double>> _getRawLoCorners() {
-    List<Map<String, double>> lo = [];
-    for (var corner in _corners) {
-      final y = double.tryParse(corner.yController.text.trim());
-      final x = double.tryParse(corner.xController.text.trim());
-      if (y != null && x != null) {
-        lo.add({'Y': y, 'X': x});
-      }
-    }
-    return lo;
-  }
+  List<ll.LatLng> get _points => [for (final c in _corners) ...[() { final w = c.westing; final s = c.southing; if (w == null || s == null) return null; return LoConverter.toWgs84(westing: w, southing: s, zone: _selectedZone, datumKey: _selectedDatum); }()]].whereType<ll.LatLng>().toList();
 
   void _openPlotMap() {
-    final points = _getConvertedCoordinates();
-    final loCorners = _getRawLoCorners();
-    if (points.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please provide valid coordinates first.')),
-      );
-      return;
-    }
-
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => PlotMapScreen(
-          points: points,
-          loCorners: loCorners,
-          zone: _selectedZone,
-          datumKey: _selectedDatum,
-          declaredHa: _declaredHa,
-        ),
-      ),
-    );
+    final pts = _points;
+    if (pts.length < 2) { _toast('Enter at least two valid corners.'); return; }
+    final loCorners = _corners.where((c) => c.westing != null && c.southing != null)
+        .map((c) => {'Y': c.westing!, 'X': c.southing!}).toList();
+    Navigator.push(context, MaterialPageRoute(builder: (_) => PlotMapScreen(
+      points: pts, loCorners: loCorners, zone: _selectedZone, datumKey: _selectedDatum, declaredHa: _declaredHa,
+      projectName: _activeProject?.name,
+    )));
   }
 
   @override
   Widget build(BuildContext context) {
     final datums = LoConverter.availableDatums(_selectedCountry.id);
+    final gpsWgs = _currentPos != null ? '${_currentPos!.latitude.toStringAsFixed(6)}, ${_currentPos!.longitude.toStringAsFixed(6)}' : 'Acquiring...';
+    String gpsLo = 'Acquiring...';
+    if (_currentPos != null) {
+      final lo = LoConverter.fromWgs84(_currentPos!, zone: _selectedZone, datumKey: _selectedDatum);
+      gpsLo = 'Y: ${lo.westing.toStringAsFixed(0)}  X: ${lo.southing.toStringAsFixed(0)}';
+    }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Plot Finder', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        title: Text(_activeProject?.name ?? 'Plot Finder', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         backgroundColor: const Color(0xFF0070BA),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.camera_alt, color: Colors.white),
-            tooltip: 'Scan Certificate',
-            onPressed: _scanCertificate,
-          ),
+          IconButton(icon: const Icon(Icons.folder_open, color: Colors.white), tooltip: 'My Plots', onPressed: _showPlotManager),
+          IconButton(icon: Icon(widget.isDark ? Icons.light_mode : Icons.dark_mode, color: Colors.white), tooltip: 'Toggle theme', onPressed: widget.onToggleTheme),
+          IconButton(icon: const Icon(Icons.camera_alt, color: Colors.white), tooltip: 'Scan Certificate', onPressed: _scanning ? null : _scanCertificate),
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Feature 2: Live GPS Display
+          if (_currentPos != null)
             Card(
-              elevation: 2,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              color: Theme.of(context).colorScheme.primaryContainer,
+              elevation: 2, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  children: [
-                    // Country selector
-                    DropdownButtonFormField<CountrySystem>(
-                      value: _selectedCountry,
-                      decoration: const InputDecoration(labelText: 'Country', border: OutlineInputBorder()),
-                      items: LoConverter.supportedCountries.map((c) {
-                        return DropdownMenuItem(value: c, child: Text('${c.label} (${c.id})'));
-                      }).toList(),
-                      onChanged: (val) {
-                        if (val != null) _onCountryChanged(val);
-                      },
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Zone selector (dynamic per country)
-                    DropdownButtonFormField<int>(
-                      value: _selectedCountry.availableZones.contains(_selectedZone)
-                          ? _selectedZone
-                          : _selectedCountry.availableZones.first,
-                      decoration: const InputDecoration(labelText: 'Lo Central Meridian', border: OutlineInputBorder()),
-                      items: _selectedCountry.availableZones.map((z) {
-                        return DropdownMenuItem(value: z, child: Text('Lo$z'));
-                      }).toList(),
-                      onChanged: (val) => setState(() => _selectedZone = val!),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Datum selector (dynamic per country)
-                    DropdownButtonFormField<String>(
-                      value: datums.any((d) => d.key == _selectedDatum) ? _selectedDatum : datums.first.key,
-                      decoration: const InputDecoration(labelText: 'Survey Datum', border: OutlineInputBorder()),
-                      items: datums.map((d) {
-                        return DropdownMenuItem(value: d.key, child: Text(d.label));
-                      }).toList(),
-                      onChanged: (val) => setState(() => _selectedDatum = val!),
-                    ),
-                  ],
-                ),
+                padding: const EdgeInsets.all(12),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    const Icon(Icons.my_location, size: 16), const SizedBox(width: 6),
+                    const Text('Current Position', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  ]),
+                  const SizedBox(height: 6),
+                  _gpsRow('WGS84', gpsWgs),
+                  _gpsRow('Lo', gpsLo),
+                ]),
               ),
             ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('Corner Coordinates', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                TextButton.icon(
-                  onPressed: _addCorner,
-                  icon: const Icon(Icons.add),
-                  label: const Text('Add Corner'),
-                ),
-              ],
-            ),
-            ListView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: _corners.length,
-              itemBuilder: (context, idx) {
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4.0),
-                  child: Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 14,
-                        backgroundColor: const Color(0xFF0070BA),
-                        child: Text('${idx + 1}', style: const TextStyle(color: Colors.white, fontSize: 12)),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: _corners[idx].yController,
-                          keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
-                          decoration: InputDecoration(
-                            labelText: 'Y (Westing)',
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: _corners[idx].xController,
-                          keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
-                          decoration: InputDecoration(
-                            labelText: 'X (Southing)',
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                        ),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.delete, color: Colors.grey),
-                        onPressed: () => _removeCorner(idx),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-            const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF0070BA),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                ),
-                onPressed: _openPlotMap,
-                icon: const Icon(Icons.map, color: Colors.white),
-                label: const Text('View Plot on Map', style: TextStyle(color: Colors.white, fontSize: 16)),
-              ),
-            ),
-          ],
-        ),
+          if (_currentPos != null) const SizedBox(height: 12),
+
+          // Country / Zone / Datum
+          Card(elevation: 2, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            child: Padding(padding: const EdgeInsets.all(16), child: Column(children: [
+              DropdownButtonFormField<CountrySystem>(value: _selectedCountry,
+                decoration: const InputDecoration(labelText: 'Country', border: OutlineInputBorder()),
+                items: LoConverter.supportedCountries.map((c) => DropdownMenuItem(value: c, child: Text('${c.label} (${c.id})'))).toList(),
+                onChanged: (v) { if (v != null) _onCountryChanged(v); }),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<int>(value: _selectedCountry.availableZones.contains(_selectedZone) ? _selectedZone : _selectedCountry.availableZones.first,
+                decoration: const InputDecoration(labelText: 'Lo Central Meridian', border: OutlineInputBorder()),
+                items: _selectedCountry.availableZones.map((z) => DropdownMenuItem(value: z, child: Text('Lo$z'))).toList(),
+                onChanged: (v) { setState(() => _selectedZone = v!); _persist(); }),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(value: datums.any((d) => d.key == _selectedDatum) ? _selectedDatum : datums.first.key,
+                decoration: const InputDecoration(labelText: 'Datum', border: OutlineInputBorder()),
+                items: datums.map((d) => DropdownMenuItem(value: d.key, child: Text(d.label))).toList(),
+                onChanged: (v) { setState(() => _selectedDatum = v!); _persist(); }),
+            ]))),
+          const SizedBox(height: 16),
+
+          // Corner list
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            const Text('Corner Coordinates', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            TextButton.icon(onPressed: _addCorner, icon: const Icon(Icons.add), label: const Text('Add Corner')),
+          ]),
+          ListView.builder(shrinkWrap: true, physics: const NeverScrollableScrollPhysics(), itemCount: _corners.length,
+            itemBuilder: (_, idx) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(children: [
+                CircleAvatar(radius: 14, backgroundColor: const Color(0xFF0070BA),
+                  child: Text('${idx+1}', style: const TextStyle(color: Colors.white, fontSize: 12))),
+                const SizedBox(width: 8),
+                Expanded(child: TextField(controller: _corners[idx].yController,
+                  keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
+                  decoration: InputDecoration(labelText: 'Y (Westing)', contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))))),
+                const SizedBox(width: 8),
+                Expanded(child: TextField(controller: _corners[idx].xController,
+                  keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
+                  decoration: InputDecoration(labelText: 'X (Southing)', contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))))),
+                IconButton(icon: const Icon(Icons.copy, size: 18, color: Colors.grey), tooltip: 'Copy coordinates', // Feature 3
+                  onPressed: () {
+                    final y = _corners[idx].yController.text;
+                    final x = _corners[idx].xController.text;
+                    Clipboard.setData(ClipboardData(text: 'Y: $y, X: $x'));
+                    _toast('Corner ${idx+1} copied');
+                  }),
+                IconButton(icon: const Icon(Icons.delete, color: Colors.grey), onPressed: () => _removeCorner(idx)),
+              ]),
+            )),
+          const SizedBox(height: 24),
+
+          // View on Map button
+          SizedBox(width: double.infinity, height: 50, child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0070BA), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            onPressed: _openPlotMap, icon: const Icon(Icons.map, color: Colors.white),
+            label: const Text('View Plot on Map', style: TextStyle(color: Colors.white, fontSize: 16)))),
+        ]),
       ),
     );
   }
+
+  Widget _gpsRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+      Text(value, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+    ]),
+  );
 }
 
-// -------------------------------------------------------------
-// Map Screen: Displays Corners, Area, and Point-to-Point Mode
-// -------------------------------------------------------------
+// ==============================================================
+// CornerInput
+// ==============================================================
+class CornerInput {
+  final TextEditingController yController;
+  final TextEditingController xController;
+  CornerInput(String y, String x) : yController = TextEditingController(text: y), xController = TextEditingController(text: x);
+  double? get westing => double.tryParse(yController.text.trim());
+  double? get southing => double.tryParse(xController.text.trim());
+}
+
+// ==============================================================
+// Plot Map Screen (Feature 1: offline tiles, Feature 3: copy, Feature 5: tap-to-measure, Feature 7: CSV/JSON)
+// ==============================================================
 class PlotMapScreen extends StatefulWidget {
   final List<ll.LatLng> points;
   final List<Map<String, double>> loCorners;
   final int zone;
   final String datumKey;
   final double? declaredHa;
-
-  const PlotMapScreen({
-    super.key,
-    required this.points,
-    required this.loCorners,
-    required this.zone,
-    required this.datumKey,
-    this.declaredHa,
-  });
+  final String? projectName;
+  const PlotMapScreen({super.key, required this.points, required this.loCorners, required this.zone, required this.datumKey, this.declaredHa, this.projectName});
 
   @override
   State<PlotMapScreen> createState() => _PlotMapScreenState();
 }
 
 class _PlotMapScreenState extends State<PlotMapScreen> {
-  final MapController _mapController = MapController();
-  int? _routeStartIdx;
-  int? _routeEndIdx;
+  final MapController _mapCtrl = MapController();
+  int? _routeStart, _routeEnd;
 
-  void _launchGoogleMapsNavigation(ll.LatLng pt) async {
-    final uri = Uri.parse('google.navigation:q=${pt.latitude},${pt.longitude}');
-    final fallbackUri = Uri.parse('https://www.google.com/maps/search/?api=1&query=${pt.latitude},${pt.longitude}');
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri);
-    } else {
-      await launchUrl(fallbackUri, mode: LaunchMode.externalApplication);
-    }
+  // Feature 5: Tap-to-measure
+  bool _measureMode = false;
+  ll.LatLng? _measureA;
+  ll.LatLng? _measureB;
+  double? _measureDist;
+  double? _measureBearing;
+
+  void _onMapTap(TapPosition tp, ll.LatLng latlng) {
+    if (!_measureMode) return;
+    setState(() {
+      if (_measureA == null || _measureB != null) {
+        _measureA = latlng;
+        _measureB = null;
+        _measureDist = null;
+        _measureBearing = null;
+      } else {
+        _measureB = latlng;
+        _measureDist = BushNavigator.distanceM(_measureA!, latlng);
+        _measureBearing = BushNavigator.bearingDeg(_measureA!, latlng);
+      }
+    });
   }
 
-  void _startBushGuidance() {
-    if (_routeStartIdx == null || _routeEndIdx == null || _routeStartIdx == _routeEndIdx) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select two different corners (Start and Target).')),
-      );
-      return;
-    }
+  void _launchNav(ll.LatLng pt) async {
+    final uri = Uri.parse('google.navigation:q=${pt.latitude},${pt.longitude}');
+    final fallback = Uri.parse('https://www.google.com/maps/search/?api=1&query=${pt.latitude},${pt.longitude}');
+    if (await canLaunchUrl(uri)) { await launchUrl(uri); }
+    else { await launchUrl(fallback, mode: LaunchMode.externalApplication); }
+  }
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => BushGuidanceScreen(
-          startPoint: widget.points[_routeStartIdx!],
-          endPoint: widget.points[_routeEndIdx!],
-          startLabel: 'Corner ${_routeStartIdx! + 1}',
-          endLabel: 'Corner ${_routeEndIdx! + 1}',
-        ),
-      ),
+  // Feature 3: Copy coordinates
+  void _copyCoords(ll.LatLng pt) {
+    final lo = LoConverter.fromWgs84(pt, zone: widget.zone, datumKey: widget.datumKey);
+    final text = 'WGS84: ${pt.latitude.toStringAsFixed(6)}, ${pt.longitude.toStringAsFixed(6)}\nLo: Y ${lo.westing.toStringAsFixed(0)}, X ${lo.southing.toStringAsFixed(0)}';
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Coordinates copied')));
+  }
+
+  // Feature 7: CSV/JSON export
+  void _exportCsv() {
+    final csv = PlotExporter.generateCsv(
+      westings: widget.loCorners.map((c) => c['Y']!).toList(),
+      southings: widget.loCorners.map((c) => c['X']!).toList(),
+      latitudes: widget.points.map((p) => p.latitude).toList(),
+      longitudes: widget.points.map((p) => p.longitude).toList(),
+      areaHectares: PlotCalculator.calculateFromLo(widget.loCorners).areaHectares,
     );
+    PlotExporter.shareFile(content: csv, fileName: 'plot_data.csv', mimeType: 'text/csv');
+  }
+
+  void _exportJson() {
+    final summary = PlotCalculator.calculateFromLo(widget.loCorners);
+    final json = PlotExporter.generateJson(
+      zone: widget.zone, datumKey: widget.datumKey,
+      westings: widget.loCorners.map((c) => c['Y']!).toList(),
+      southings: widget.loCorners.map((c) => c['X']!).toList(),
+      latitudes: widget.points.map((p) => p.latitude).toList(),
+      longitudes: widget.points.map((p) => p.longitude).toList(),
+      areaHectares: summary.areaHectares, perimeterMeters: summary.perimeterMeters,
+    );
+    PlotExporter.shareFile(content: json, fileName: 'plot_data.json', mimeType: 'application/json');
   }
 
   @override
@@ -920,350 +716,342 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Plot Boundary', style: TextStyle(color: Colors.white)),
+        title: Text(widget.projectName ?? 'Plot Boundary', style: const TextStyle(color: Colors.white)),
         backgroundColor: const Color(0xFF0070BA),
         actions: [
+          // Feature 5: Measure toggle
+          IconButton(
+            icon: Icon(_measureMode ? Icons.straighten : Icons.straighten, color: _measureMode ? Colors.yellow : Colors.white),
+            tooltip: _measureMode ? 'Exit measure' : 'Measure distance',
+            onPressed: () => setState(() { _measureMode = !_measureMode; _measureA = null; _measureB = null; _measureDist = null; }),
+          ),
+          // Feature 7: Export menu (KML, GPX, CSV, JSON)
           PopupMenuButton<String>(
-            icon: const Icon(Icons.share, color: Colors.white),
-            tooltip: 'Export Coordinates',
-            onSelected: (choice) async {
-              if (widget.points.isEmpty) return;
-
-              if (choice == 'kml') {
-                final kmlData = PlotExporter.generateKml(widget.points);
-                await PlotExporter.shareFile(
-                  content: kmlData,
-                  fileName: 'plot_boundary.kml',
-                  mimeType: 'application/vnd.google-earth.kml+xml',
-                );
-              } else if (choice == 'gpx') {
-                final gpxData = PlotExporter.generateGpx(widget.points);
-                await PlotExporter.shareFile(
-                  content: gpxData,
-                  fileName: 'plot_boundary.gpx',
-                  mimeType: 'application/gpx+xml',
-                );
-              }
+            icon: const Icon(Icons.share, color: Colors.white), tooltip: 'Export',
+            onSelected: (c) async {
+              if (c == 'kml') { PlotExporter.shareFile(content: PlotExporter.generateKml(widget.points), fileName: 'plot_boundary.kml', mimeType: 'application/vnd.google-earth.kml+xml'); }
+              else if (c == 'gpx') { PlotExporter.shareFile(content: PlotExporter.generateGpx(widget.points), fileName: 'plot_boundary.gpx', mimeType: 'application/gpx+xml'); }
+              else if (c == 'csv') { _exportCsv(); }
+              else if (c == 'json') { _exportJson(); }
             },
-            itemBuilder: (context) => const [
-              PopupMenuItem(
-                value: 'kml',
-                child: Row(
-                  children: [
-                    Icon(Icons.public, color: Color(0xFF0070BA)),
-                    SizedBox(width: 8),
-                    Text('Export to Google Earth (.KML)'),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'gpx',
-                child: Row(
-                  children: [
-                    Icon(Icons.gps_fixed, color: Color(0xFF0070BA)),
-                    SizedBox(width: 8),
-                    Text('Export to Garmin GPS (.GPX)'),
-                  ],
-                ),
-              ),
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'kml', child: Row(children: [Icon(Icons.public, color: Color(0xFF0070BA)), SizedBox(width: 8), Text('KML (Google Earth)')])),
+              PopupMenuItem(value: 'gpx', child: Row(children: [Icon(Icons.gps_fixed, color: Color(0xFF0070BA)), SizedBox(width: 8), Text('GPX (Garmin GPS)')])),
+              PopupMenuItem(value: 'csv', child: Row(children: [Icon(Icons.table_chart, color: Color(0xFF0070BA)), SizedBox(width: 8), Text('CSV (Excel)')])),
+              PopupMenuItem(value: 'json', child: Row(children: [Icon(Icons.code, color: Color(0xFF0070BA)), SizedBox(width: 8), Text('JSON (Survey software)')])),
             ],
           ),
         ],
       ),
-      body: Stack(
-        children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: center,
-              initialZoom: 15.0,
+      body: Stack(children: [
+        // Feature 1: Offline tile caching
+        FlutterMap(
+          mapController: _mapCtrl,
+          options: MapOptions(initialCenter: center, initialZoom: 15.0, onTap: _onMapTap),
+          children: [
+            TileLayer(
+              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              tileProvider: OfflineTileProvider(),
+              userAgentPackageName: 'com.example.plot_finder',
             ),
-            children: [
-              TileLayer(
-                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                userAgentPackageName: 'com.example.botswana_plot_finder',
+            if (widget.points.length >= 3)
+              PolygonLayer(polys: [Polygon(points: widget.points, color: Colors.blue.withOpacity(0.2), borderColor: const Color(0xFF0070BA), borderStrokeWidth: 3)]),
+            MarkerLayer(markers: widget.points.asMap().entries.map((e) => Marker(
+              point: e.value, width: 80, height: 80,
+              child: GestureDetector(
+                onTap: () => _showCornerSheet(e.key, e.value),
+                child: Column(children: [
+                  Container(padding: const EdgeInsets.all(3), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.black26)),
+                    child: Text('C${e.key+1}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold))),
+                  const Icon(Icons.location_pin, color: Colors.red, size: 36),
+                ]),
               ),
-                            SimpleAttributionWidget(
-                source: const Text('OpenStreetMap contributors'),
-                onTap: () => launchUrl(Uri.parse('https://openstreetmap.org/copyright')),
-              ),
-              if (widget.points.length >= 3)
-                PolygonLayer(
-                  polygons: [
-                    Polygon(
-                      points: widget.points,
-                      color: Colors.blue.withOpacity(0.2),
-                      borderColor: const Color(0xFF0070BA),
-                      borderStrokeWidth: 3,
-                    ),
-                  ],
-                ),
-              MarkerLayer(
-                markers: widget.points.asMap().entries.map((entry) {
-                  int idx = entry.key;
-                  ll.LatLng pt = entry.value;
-                  return Marker(
-                    point: pt,
-                    width: 80,
-                    height: 80,
-                    child: GestureDetector(
-                      onTap: () {
-                        showModalBottomSheet(
-                          context: context,
-                          builder: (ctx) => Container(
-                            padding: const EdgeInsets.all(16),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text('Corner ${idx + 1}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                                Text('Lat: ${pt.latitude.toStringAsFixed(6)}'),
-                                Text('Lon: ${pt.longitude.toStringAsFixed(6)}'),
-                                const SizedBox(height: 12),
-                                ElevatedButton.icon(
-                                  onPressed: () => _launchGoogleMapsNavigation(pt),
-                                  icon: const Icon(Icons.navigation),
-                                  label: const Text('Drive with Google Maps'),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                      child: Column(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.black26)),
-                            child: Text('C${idx + 1}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-                          ),
-                          const Icon(Icons.location_pin, color: Colors.red, size: 36),
-                        ],
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ],
-          ),
-          Positioned(
-            top: 12,
-            left: 12,
-            right: 12,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                PlotSummaryCard(summary: summary),
-                if (widget.declaredHa != null)
-                  AreaAuditBanner(
-                    audit: AreaAuditor.auditArea(
-                      computedHectares: summary.areaHectares,
-                      statedHectares: widget.declaredHa!,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Positioned(
-            bottom: 16,
-            left: 16,
-            right: 16,
-            child: Card(
-              elevation: 4,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-              child: Padding(
-                padding: const EdgeInsets.all(12.0),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('Straight Bush Run (Pipes / Fence / Wires)', style: TextStyle(fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: DropdownButtonFormField<int>(
-                            value: _routeStartIdx,
-                            decoration: const InputDecoration(labelText: 'From Point', border: OutlineInputBorder()),
-                            items: List.generate(
-                              widget.points.length,
-                              (i) => DropdownMenuItem(value: i, child: Text('Corner ${i + 1}')),
-                            ),
-                            onChanged: (val) => setState(() => _routeStartIdx = val),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: DropdownButtonFormField<int>(
-                            value: _routeEndIdx,
-                            decoration: const InputDecoration(labelText: 'To Point', border: OutlineInputBorder()),
-                            items: List.generate(
-                              widget.points.length,
-                              (i) => DropdownMenuItem(value: i, child: Text('Corner ${i + 1}')),
-                            ),
-                            onChanged: (val) => setState(() => _routeEndIdx = val),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-                        onPressed: _startBushGuidance,
-                        icon: const Icon(Icons.compass_calibration, color: Colors.white),
-                        label: const Text('Start Bush Line Guidance', style: TextStyle(color: Colors.white)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
+            )).toList()),
+            // Feature 5: Measure markers
+            if (_measureA != null)
+              Marker(point: _measureA!, width: 30, height: 30, child: const Icon(Icons.circle, color: Colors.green, size: 24)),
+            if (_measureB != null)
+              Marker(point: _measureB!, width: 30, height: 30, child: const Icon(Icons.circle, color: Colors.red, size: 24)),
+            if (_measureA != null && _measureB != null)
+              PolylineLayer(polylines: [Polyline(points: [_measureA!, _measureB!], color: Colors.orange, strokeWidth: 3)]),
+            // OSM Attribution
+            SimpleAttributionWidget(source: const Text('OpenStreetMap'), onTap: () => launchUrl(Uri.parse('https://openstreetmap.org/copyright'))),
+          ],
+        ),
+
+        // Feature 5: Measure result overlay
+        if (_measureDist != null)
+          Positioned(top: 12, left: 12, child: Card(
+            color: Colors.orange.shade50,
+            child: Padding(padding: const EdgeInsets.all(10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${_measureDist!.toStringAsFixed(1)} m', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.orange)),
+              Text('${_measureBearing!.toStringAsFixed(0)}°', style: const TextStyle(fontSize: 14, color: Colors.grey)),
+            ])),
+          )),
+
+        // Feature 5: Measure mode indicator
+        if (_measureMode)
+          Positioned(top: 12, right: 12, child: Chip(
+            avatar: const Icon(Icons.straighten, size: 16),
+            label: Text(_measureA == null ? 'Tap point A' : 'Tap point B'),
+            backgroundColor: Colors.orange.shade100,
+          )),
+
+        // Area summary card
+        Positioned(top: 12, left: _measureMode ? 12 : 12, right: _measureMode ? 120 : 12, child: Column(children: [
+          PlotSummaryCard(summary: summary),
+          if (widget.declaredHa != null)
+            AreaAuditBanner(audit: AreaAuditor.auditArea(computedHectares: summary.areaHectares, statedHectares: widget.declaredHa!)),
+        ])),
+
+        // Bush run controls
+        Positioned(bottom: 16, left: 16, right: 16, child: Card(
+          elevation: 4, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          child: Padding(padding: const EdgeInsets.all(12), child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('Bush Line Guidance', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(child: DropdownButtonFormField<int>(value: _routeStart,
+                decoration: const InputDecoration(labelText: 'From', border: OutlineInputBorder()),
+                items: List.generate(widget.points.length, (i) => DropdownMenuItem(value: i, child: Text('C${i+1}'))),
+                onChanged: (v) => setState(() => _routeStart = v))),
+              const SizedBox(width: 8),
+              Expanded(child: DropdownButtonFormField<int>(value: _routeEnd,
+                decoration: const InputDecoration(labelText: 'To', border: OutlineInputBorder()),
+                items: List.generate(widget.points.length, (i) => DropdownMenuItem(value: i, child: Text('C${i+1}'))),
+                onChanged: (v) => setState(() => _routeEnd = v))),
+            ]),
+            const SizedBox(height: 8),
+            SizedBox(width: double.infinity, child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+              onPressed: () {
+                if (_routeStart == null || _routeEnd == null || _routeStart == _routeEnd) { _toast('Select two different corners.'); return; }
+                Navigator.push(context, MaterialPageRoute(builder: (_) => BushGuidanceScreen(
+                  startPoint: widget.points[_routeStart!], endPoint: widget.points[_routeEnd!],
+                  startLabel: 'C${_routeStart!+1}', endLabel: 'C${_routeEnd!+1}')));
+              },
+              icon: const Icon(Icons.compass_calibration, color: Colors.white),
+              label: const Text('Start Guidance', style: TextStyle(color: Colors.white)),
+            )),
+          ])),
+        )),
+      ]),
+    );
+  }
+
+  void _showCornerSheet(int idx, ll.LatLng pt) {
+    final lo = LoConverter.fromWgs84(pt, zone: widget.zone, datumKey: widget.datumKey);
+    showModalBottomSheet(context: context, builder: (ctx) => Container(
+      padding: const EdgeInsets.all(16),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Corner ${idx+1}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        Text('Lat: ${pt.latitude.toStringAsFixed(7)}'),
+        Text('Lon: ${pt.longitude.toStringAsFixed(7)}'),
+        Text('Lo Y: ${lo.westing.toStringAsFixed(0)}  X: ${lo.southing.toStringAsFixed(0)}'),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(child: ElevatedButton.icon(
+            onPressed: () { _copyCoords(pt); Navigator.pop(ctx); },
+            icon: const Icon(Icons.copy), label: const Text('Copy'))),
+          const SizedBox(width: 8),
+          Expanded(child: ElevatedButton.icon(
+            onPressed: () { _launchNav(pt); Navigator.pop(ctx); },
+            icon: const Icon(Icons.navigation), label: const Text('Navigate'))),
+        ]),
+      ]),
+    ));
+  }
+
+  void _toast(String m) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m))); }
+}
+
+// ==============================================================
+// Area Audit Banner
+// ==============================================================
+class AreaAuditBanner extends StatelessWidget {
+  final AreaVerificationResult audit;
+  const AreaAuditBanner({super.key, required this.audit});
+  @override
+  Widget build(BuildContext context) {
+    if (audit.statedHectares <= 0) return const SizedBox.shrink();
+    final isAlert = audit.isMismatch;
+    final bg = isAlert ? Colors.amber.shade50 : Colors.green.shade50;
+    final border = isAlert ? Colors.orange.shade700 : Colors.green.shade700;
+    final ic = isAlert ? Colors.orange.shade800 : Colors.green.shade800;
+    return Container(
+      margin: const EdgeInsets.only(top: 6), padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8), border: Border.all(color: border, width: 1.2)),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(isAlert ? Icons.warning_amber_rounded : Icons.verified_user_outlined, color: ic, size: 24),
+        const SizedBox(width: 10),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(isAlert ? 'Area Mismatch Alert' : 'Certificate Verified', style: TextStyle(fontWeight: FontWeight.bold, color: ic, fontSize: 13)),
+          const SizedBox(height: 3),
+          Text(audit.message, style: TextStyle(fontSize: 12, color: isAlert ? Colors.brown.shade900 : Colors.green.shade900)),
+          if (isAlert) const SizedBox(height: 4),
+          if (isAlert) const Text('Verify corner order and coordinate signs.', style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.black54)),
+        ])),
+      ]),
     );
   }
 }
 
-// -------------------------------------------------------------
-// Live Bush Tracker (Line Following Screen)
-// -------------------------------------------------------------
-class BushGuidanceScreen extends StatefulWidget {
-  final ll.LatLng startPoint;
-  final ll.LatLng endPoint;
-  final String startLabel;
-  final String endLabel;
+// ==============================================================
+// Plot Summary Card
+// ==============================================================
+class PlotSummaryCard extends StatelessWidget {
+  final PlotCalculationResult summary;
+  const PlotSummaryCard({super.key, required this.summary});
+  @override
+  Widget build(BuildContext context) {
+    return Card(elevation: 4, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Total Land Area', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            Text('${summary.areaHectares.toStringAsFixed(2)} Ha', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF0070BA))),
+            Text('${summary.areaSqMeters.toStringAsFixed(0)} m²', style: const TextStyle(fontSize: 12)),
+          ]),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            const Text('Perimeter', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            Text('${summary.perimeterMeters.toStringAsFixed(1)} m', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          ]),
+        ]),
+        const Divider(height: 18),
+        const Text('Fence Lines:', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+        const SizedBox(height: 6),
+        Wrap(spacing: 8, runSpacing: 4, children: summary.segments.map((s) => Chip(
+          visualDensity: VisualDensity.compact, backgroundColor: Colors.grey.shade100,
+          label: Text('C${s.fromCorner} → C${s.toCorner}: ${s.lengthMeters.toStringAsFixed(1)}m', style: const TextStyle(fontSize: 11)),
+        )).toList()),
+      ])),
+    );
+  }
+}
 
-  const BushGuidanceScreen({
-    super.key,
-    required this.startPoint,
-    required this.endPoint,
-    required this.startLabel,
-    required this.endLabel,
-  });
+// ==============================================================
+// Bush Guidance Screen (Feature 6: Compass overlay)
+// ==============================================================
+class BushGuidanceScreen extends StatefulWidget {
+  final ll.LatLng startPoint, endPoint;
+  final String startLabel, endLabel;
+  const BushGuidanceScreen({super.key, required this.startPoint, required this.endPoint, required this.startLabel, required this.endLabel});
 
   @override
   State<BushGuidanceScreen> createState() => _BushGuidanceScreenState();
 }
 
 class _BushGuidanceScreenState extends State<BushGuidanceScreen> {
-  StreamSubscription<Position>? _positionStream;
-  double _crossTrackError = 0.0;
-  double _distanceRemaining = 0.0;
-  double _targetBearing = 0.0;
-  bool _hasGpsFix = false;
+  StreamSubscription<Position>? _gpsSub;
+  StreamSubscription<CompassEvent>? _compassSub;
+  double _xt = 0, _distRemain = 0, _targetBearing = 0;
+  double _heading = 0; // Feature 6: compass heading
+  bool _gpsFix = false;
+  bool _overshoot = false;
 
   @override
   void initState() {
     super.initState();
-    _startLiveTracking();
+    _targetBearing = BushNavigator.bearingDeg(widget.startPoint, widget.endPoint);
+    _startGps();
+    _startCompass();
   }
 
-  void _startLiveTracking() async {
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) return;
+  void _startGps() async {
+    if (!await Geolocator.isLocationServiceEnabled()) return;
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+    if (perm == LocationPermission.denied) return;
 
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) return;
-    }
-
-    _targetBearing = BushNavigator.getTargetBearing(widget.startPoint, widget.endPoint);
-
-    const locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 1,
-    );
-
-    _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings).listen((Position position) {
-      final current = ll.LatLng(position.latitude, position.longitude);
+    _gpsSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.bestForNavigation, distanceFilter: 1),
+    ).listen((pos) {
+      final cur = ll.LatLng(pos.latitude, pos.longitude);
       setState(() {
-        _hasGpsFix = true;
-        _crossTrackError = BushNavigator.getCrossTrackError(current, widget.startPoint, widget.endPoint);
-        _distanceRemaining = BushNavigator.getDistanceRemaining(current, widget.endPoint);
+        _gpsFix = true;
+        _xt = BushNavigator.crossTrack(cur, widget.startPoint, widget.endPoint);
+        _distRemain = BushNavigator.distanceM(cur, widget.endPoint);
+        _overshoot = BushNavigator.alongTrack(cur, widget.startPoint, widget.endPoint) >
+            BushNavigator.distanceM(widget.startPoint, widget.endPoint);
       });
     });
   }
 
-  @override
-  void dispose() {
-    _positionStream?.cancel();
-    super.dispose();
+  void _startCompass() {
+    if (!FlutterCompass.isSupported) return;
+    _compassSub = FlutterCompass.events?.listen((event) {
+      if (mounted) setState(() => _heading = event.heading ?? 0);
+    });
   }
 
   @override
+  void dispose() { _gpsSub?.cancel(); _compassSub?.cancel(); super.dispose(); }
+
+  @override
   Widget build(BuildContext context) {
-    bool onTrack = _crossTrackError.abs() <= 1.5;
-    String correctionMessage = _crossTrackError > 0
-        ? 'VEER LEFT ${(_crossTrackError).abs().toStringAsFixed(1)} m'
-        : 'VEER RIGHT ${(_crossTrackError).abs().toStringAsFixed(1)} m';
+    final onTrack = !_overshoot && _xt.abs() <= 1.5;
+    final veer = _xt > 0 ? 'VEER LEFT ${_xt.abs().toStringAsFixed(1)} m' : 'VEER RIGHT ${_xt.abs().toStringAsFixed(1)} m';
+    final headingDiff = (_heading - _targetBearing + 360) % 360;
+    final headingCorrect = headingDiff < 5 || headingDiff > 355;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${widget.startLabel} \u2794 ${widget.endLabel}', style: const TextStyle(color: Colors.white)),
+        title: Text('${widget.startLabel} → ${widget.endLabel}', style: const TextStyle(color: Colors.white)),
         backgroundColor: const Color(0xFF0070BA),
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                'Compass Cutline Bearing: ${_targetBearing.toStringAsFixed(0)}\u00B0',
-                style: const TextStyle(fontSize: 20, color: Colors.grey, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 40),
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 300),
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: !_hasGpsFix
-                      ? Colors.grey.shade200
-                      : onTrack
-                          ? Colors.green.shade100
-                          : Colors.red.shade100,
-                ),
-                child: Icon(
-                  !_hasGpsFix
-                      ? Icons.gps_not_fixed
-                      : onTrack
-                          ? Icons.check_circle
-                          : Icons.navigation,
-                  size: 90,
-                  color: !_hasGpsFix
-                      ? Colors.grey
-                      : onTrack
-                          ? Colors.green
-                          : Colors.red,
-                ),
-              ),
-              const SizedBox(height: 32),
-              if (!_hasGpsFix)
-                const Text('Acquiring high-accuracy GPS fix in the field...', style: TextStyle(fontSize: 16))
-              else ...[
-                Text(
-                  onTrack ? 'ON STRAIGHT CUTLINE' : correctionMessage,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
-                    color: onTrack ? Colors.green.shade800 : Colors.red.shade800,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Distance to Endpoint: ${_distanceRemaining.toStringAsFixed(1)} m',
-                  style: const TextStyle(fontSize: 18, color: Colors.black87),
-                ),
-              ],
-            ],
-          ),
+      body: Center(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+        // Feature 6: Compass + bearing display
+        Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text('Bearing: ${_targetBearing.toStringAsFixed(0)}°', style: const TextStyle(fontSize: 18, color: Colors.grey, fontWeight: FontWeight.bold)),
+          const SizedBox(width: 16),
+          Text('Heading: ${_heading.toStringAsFixed(0)}°', style: TextStyle(fontSize: 18, color: headingCorrect ? Colors.green : Colors.orange, fontWeight: FontWeight.bold)),
+        ]),
+        const SizedBox(height: 24),
+
+        // Feature 6: Compass rose
+        if (_gpsFix) SizedBox(width: 160, height: 160, child: Stack(alignment: Alignment.center, children: [
+          Transform.rotate(angle: -_heading * pi / 180, child: Container(
+            width: 150, height: 150,
+            decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: Colors.grey.shade300, width: 3)),
+            child: Stack(alignment: Alignment.center, children: [
+              const Positioned(top: 4, child: Text('N', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.red))),
+              const Positioned(bottom: 4, child: Text('S', style: TextStyle(fontSize: 12, color: Colors.grey))),
+              const Positioned(left: 4, child: Text('W', style: TextStyle(fontSize: 12, color: Colors.grey))),
+              const Positioned(right: 4, child: Text('E', style: TextStyle(fontSize: 12, color: Colors.grey))),
+              // Target bearing arrow
+              Transform.rotate(angle: (_targetBearing - _heading) * pi / 180, child:
+                const Icon(Icons.navigation, size: 40, color: Color(0xFF0070BA))),
+            ]),
+          )),
+          Container(width: 12, height: 12, decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white, border: Border.all(color: Colors.grey)),
+            child: const Icon(Icons.my_location, size: 10)),
+        ])),
+        if (!_gpsFix) const SizedBox(height: 160, child: Center(child: CircularProgressIndicator())),
+        const SizedBox(height: 32),
+
+        // Status indicator
+        AnimatedContainer(duration: const Duration(milliseconds: 300), padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(shape: BoxShape.circle,
+            color: !_gpsFix ? Colors.grey.shade200 : onTrack ? Colors.green.shade100 : Colors.red.shade100),
+          child: Icon(
+            !_gpsFix ? Icons.gps_not_fixed : onTrack ? Icons.check_circle : _overshoot ? Icons.flag : Icons.navigation,
+            size: 72, color: !_gpsFix ? Colors.grey : onTrack ? Colors.green : _overshoot ? Colors.orange : Colors.red),
         ),
-      ),
-    );
+        const SizedBox(height: 24),
+
+        if (!_gpsFix)
+          const Text('Acquiring GPS fix...', style: TextStyle(fontSize: 16))
+        else ...[
+          Text(_overshoot ? 'PASSED TARGET — TURN BACK' : onTrack ? 'ON STRAIGHT CUTLINE' : veer,
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold,
+              color: _overshoot ? Colors.orange.shade800 : onTrack ? Colors.green.shade800 : Colors.red.shade800)),
+          const SizedBox(height: 12),
+          Text('${_distRemain.toStringAsFixed(1)} m to endpoint', style: const TextStyle(fontSize: 18, color: Colors.black87)),
+          const SizedBox(height: 8),
+          Text('Cross-track: ${_xt.abs().toStringAsFixed(1)} m ${_xt > 0 ? '(right of line)' : '(left of line)'}',
+            style: const TextStyle(fontSize: 14, color: Colors.grey)),
+        ],
+      ]))));
   }
 }
