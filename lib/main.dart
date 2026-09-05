@@ -354,7 +354,28 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
 
   Future<void> _scanCertificate() async {
     final picker = ImagePicker();
-    final photo = await picker.pickImage(source: ImageSource.camera);
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.camera_alt),
+              title: const Text('Take Photo'),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library),
+              title: const Text('Choose from Gallery'),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+
+    final photo = await picker.pickImage(source: source);
     if (photo == null) return;
 
     final inputImage = InputImage.fromFilePath(photo.path);
