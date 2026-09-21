@@ -4,6 +4,7 @@ class AreaVerificationResult {
   final double percentageDiff;
   final bool isMismatch;
   final String message;
+  final double tolerancePercent;
 
   AreaVerificationResult({
     required this.statedHectares,
@@ -11,6 +12,7 @@ class AreaVerificationResult {
     required this.percentageDiff,
     required this.isMismatch,
     required this.message,
+    this.tolerancePercent = 5.0,
   });
 }
 
@@ -28,7 +30,8 @@ class AreaAuditor {
     return null;
   }
 
-  /// Compares computed area against stated area
+  /// Compares computed (shoelace) area against certificate declared area.
+  /// Wording is "calculated vs certificate" — not "verified / survey-grade".
   static AreaVerificationResult auditArea({
     required double computedHectares,
     required double statedHectares,
@@ -40,22 +43,29 @@ class AreaAuditor {
         computedHectares: computedHectares,
         percentageDiff: 0,
         isMismatch: false,
-        message: 'No declared area specified on certificate.',
+        tolerancePercent: tolerancePercent,
+        message: 'No declared area on certificate to compare.',
       );
     }
 
-    double diff = ((computedHectares - statedHectares).abs() / statedHectares) * 100.0;
-    bool mismatch = diff > tolerancePercent;
+    final diff =
+        ((computedHectares - statedHectares).abs() / statedHectares) * 100.0;
+    final mismatch = diff > tolerancePercent;
 
-    String msg = mismatch
-        ? 'Warning: Computed area (${computedHectares.toStringAsFixed(2)} Ha) differs from certificate (${statedHectares.toStringAsFixed(2)} Ha) by ${diff.toStringAsFixed(1)}%.'
-        : 'Area verified: Computed area matches stated certificate area within normal survey tolerance.';
+    final msg = mismatch
+        ? 'Calculated ${computedHectares.toStringAsFixed(2)} Ha vs certificate '
+            '${statedHectares.toStringAsFixed(2)} Ha '
+            '(${diff.toStringAsFixed(1)}% apart — tolerance ±${tolerancePercent.toStringAsFixed(0)}%). '
+            'Check corner order, decimals, and Lo zone.'
+        : 'Calculated ${computedHectares.toStringAsFixed(2)} Ha matches certificate '
+            '${statedHectares.toStringAsFixed(2)} Ha within ±${tolerancePercent.toStringAsFixed(0)}% tolerance.';
 
     return AreaVerificationResult(
       statedHectares: statedHectares,
       computedHectares: computedHectares,
       percentageDiff: diff,
       isMismatch: mismatch,
+      tolerancePercent: tolerancePercent,
       message: msg,
     );
   }

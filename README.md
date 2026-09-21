@@ -41,3 +41,13 @@ flutter build apk --release --split-per-abi
 ## Countries / datums
 
 Botswana, South Africa, Namibia, Zimbabwe, Eswatini, Lesotho — Cape / Hartebeesthoek94 / Schwarzeck / Arc 1950 / BTRS02 as applicable.
+
+## Offline maps (v4.3+)
+- Basemap tiles use **CartoCDN Voyager** (OSM data) with disk cache (~60 days).
+- On any plot/path map, tap **Download map** to prefetch tiles for the current area (padded bbox, z12–16, capped).
+- Prefer this over bulk OpenStreetMap tile scraping. Attribution: © OpenStreetMap / CARTO.
+- Google Maps is optional (`MAPS_API_KEY` in `android/local.properties` + `--dart-define`); without a key the app shows an in-app dialog and keeps the offline basemap.
+
+## Application ID
+Left as `com.example.botswana_plot_finder` to avoid breaking sideload upgrades. userAgent uses `com.pathfinder.sadc`.
+

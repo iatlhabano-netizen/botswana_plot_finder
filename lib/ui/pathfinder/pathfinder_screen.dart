@@ -6,6 +6,7 @@ import 'package:latlong2/latlong.dart' as ll;
 
 import '../../core/lo_converter.dart';
 import '../../core/path_guidance.dart';
+import '../../services/gps_service.dart';
 import '../theme.dart';
 import '../widgets/hybrid_map.dart';
 import 'guidance_screen.dart';
@@ -67,30 +68,21 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
       _endLat.text = widget.initialEnd!.latitude.toStringAsFixed(7);
       _endLon.text = widget.initialEnd!.longitude.toStringAsFixed(7);
     }
-    _startGps();
+    // GPS starts when user selects GPS source or taps locate — not in initState.
   }
 
   Future<void> _startGps() async {
-    if (!await Geolocator.isLocationServiceEnabled()) return;
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-    }
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) {
-      return;
-    }
+    if (_gpsSub != null) return;
+    if (!await GpsService.ensurePermission(context)) return;
     try {
       final pos = await Geolocator.getCurrentPosition();
       if (mounted) {
         setState(() => _gps = ll.LatLng(pos.latitude, pos.longitude));
       }
     } catch (_) {}
-    _gpsSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 5,
-      ),
+    _gpsSub = GpsService.watch(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 5,
     ).listen((pos) {
       if (mounted) {
         setState(() => _gps = ll.LatLng(pos.latitude, pos.longitude));
@@ -168,8 +160,11 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     }
     ll.LatLng start;
     if (locateMode) {
+      // ensure GPS then retry message if still null
+      // (caller should have awaited; we kick off here)
       if (_gps == null) {
-        _toast('Waiting for GPS fix to locate from your position.');
+        _startGps();
+        _toast('Getting GPS — tap Locate again once position appears.');
         return;
       }
       start = _gps!;
@@ -212,7 +207,7 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         : null;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Pathfinder')),
+      appBar: AppBar(title: const Text('Walk a line')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -227,7 +222,10 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
           _endpointCard(
             title: 'Start',
             source: _startSrc,
-            onSource: (v) => setState(() => _startSrc = v),
+            onSource: (v) {
+              setState(() => _startSrc = v);
+              if (v == _PointSource.gps) _startGps();
+            },
             lat: _startLat,
             lon: _startLon,
             y: _startY,

@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/maps_config.dart';
 import '../../services/offline_tile_provider.dart';
+import '../../services/tile_prefetch.dart';
 
 class MapMarkerData {
   final ll.LatLng point;
@@ -30,6 +31,8 @@ class HybridMap extends StatefulWidget {
   final ll.LatLng? userLocation;
   final void Function(ll.LatLng)? onTap;
   final bool showOfflineBanner;
+  final bool fitToFeatures;
+  final bool showDownloadButton;
 
   const HybridMap({
     super.key,
@@ -41,6 +44,8 @@ class HybridMap extends StatefulWidget {
     this.userLocation,
     this.onTap,
     this.showOfflineBanner = true,
+    this.fitToFeatures = true,
+    this.showDownloadButton = true,
   });
 
   @override
@@ -50,11 +55,23 @@ class HybridMap extends StatefulWidget {
 class _HybridMapState extends State<HybridMap> {
   bool _preferOsm = false;
   bool _loaded = false;
+  bool _fitted = false;
+  bool _downloading = false;
   gmaps.GoogleMapController? _gCtrl;
   final MapController _osmCtrl = MapController();
 
   bool get _useGoogle =>
       MapsConfig.isGoogleMapsConfigured && !_preferOsm;
+
+  List<ll.LatLng> get _allPoints {
+    final pts = <ll.LatLng>[
+      ...widget.polygon,
+      ...widget.polyline,
+      ...widget.markers.map((m) => m.point),
+    ];
+    if (widget.userLocation != null) pts.add(widget.userLocation!);
+    return pts;
+  }
 
   @override
   void initState() {
@@ -73,22 +90,142 @@ class _HybridMapState extends State<HybridMap> {
   Future<void> setPreferOsm(bool v) async {
     final sp = await SharedPreferences.getInstance();
     await sp.setBool(MapsConfig.preferOsmKey, v);
-    setState(() => _preferOsm = v);
+    setState(() {
+      _preferOsm = v;
+      _fitted = false;
+    });
+  }
+
+  LatLngBounds? _boundsOf(List<ll.LatLng> pts) {
+    if (pts.length < 2) return null;
+    double minLat = pts.first.latitude, maxLat = pts.first.latitude;
+    double minLon = pts.first.longitude, maxLon = pts.first.longitude;
+    for (final p in pts) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLon) minLon = p.longitude;
+      if (p.longitude > maxLon) maxLon = p.longitude;
+    }
+    // Pad slightly
+    final dLat = (maxLat - minLat).abs() * 0.15 + 0.0005;
+    final dLon = (maxLon - minLon).abs() * 0.15 + 0.0005;
+    return LatLngBounds(
+      ll.LatLng(minLat - dLat, minLon - dLon),
+      ll.LatLng(maxLat + dLat, maxLon + dLon),
+    );
+  }
+
+  void _fitOsm() {
+    if (!widget.fitToFeatures || _fitted) return;
+    final b = _boundsOf(_allPoints);
+    if (b == null) return;
+    try {
+      _osmCtrl.fitCamera(
+        CameraFit.bounds(bounds: b, padding: const EdgeInsets.all(36)),
+      );
+      _fitted = true;
+    } catch (_) {}
+  }
+
+  Future<void> _fitGoogle() async {
+    if (!widget.fitToFeatures || _fitted || _gCtrl == null) return;
+    final pts = _allPoints;
+    if (pts.length < 2) return;
+    double minLat = pts.first.latitude, maxLat = pts.first.latitude;
+    double minLon = pts.first.longitude, maxLon = pts.first.longitude;
+    for (final p in pts) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLon) minLon = p.longitude;
+      if (p.longitude > maxLon) maxLon = p.longitude;
+    }
+    try {
+      await _gCtrl!.animateCamera(
+        gmaps.CameraUpdate.newLatLngBounds(
+          gmaps.LatLngBounds(
+            southwest: gmaps.LatLng(minLat, minLon),
+            northeast: gmaps.LatLng(maxLat, maxLon),
+          ),
+          48,
+        ),
+      );
+      _fitted = true;
+    } catch (_) {}
   }
 
   @override
   void didUpdateWidget(covariant HybridMap oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.center != widget.center) {
-      _gCtrl?.animateCamera(
-        gmaps.CameraUpdate.newLatLng(
-          gmaps.LatLng(widget.center.latitude, widget.center.longitude),
+    if (oldWidget.center != widget.center ||
+        oldWidget.polygon != widget.polygon ||
+        oldWidget.polyline != widget.polyline) {
+      _fitted = false;
+      if (!_useGoogle) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _fitOsm());
+      } else {
+        _fitGoogle();
+      }
+    }
+  }
+
+  Future<void> _downloadArea() async {
+    final pts = _allPoints;
+    if (pts.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nothing to download yet — add a plot or path.')),
+      );
+      return;
+    }
+    setState(() => _downloading = true);
+    try {
+      final result = await TilePrefetch.downloadRegion(
+        points: pts,
+        onProgress: (done, total) {
+          // quiet — snack at end
+        },
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Downloaded ${result.saved} map tiles'
+            '${result.failed > 0 ? " (${result.failed} failed)" : ""}. '
+            '${result.note}',
+          ),
+          duration: const Duration(seconds: 5),
         ),
       );
-      try {
-        _osmCtrl.move(widget.center, _osmCtrl.camera.zoom);
-      } catch (_) {}
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Map download failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
     }
+  }
+
+  void _showMissingKeyDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Google Maps not configured'),
+        content: const Text(
+          'No Google Maps API key is set for this build. '
+          'Pathfinder uses the offline-friendly Carto/OSM basemap instead. '
+          'Coordinates, Locate guidance, and external map links still work.\n\n'
+          'To enable Google tiles, add MAPS_API_KEY to android/local.properties '
+          'and rebuild with --dart-define=MAPS_API_KEY=…',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Got it'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -109,6 +246,24 @@ class _HybridMapState extends State<HybridMap> {
               usingGoogle: _useGoogle,
               hasKey: MapsConfig.isGoogleMapsConfigured,
               onToggleOsm: () => setPreferOsm(!_preferOsm),
+              onMissingKey: _showMissingKeyDialog,
+            ),
+          ),
+        if (widget.showDownloadButton)
+          Positioned(
+            bottom: 12,
+            right: 12,
+            child: FloatingActionButton.extended(
+              heroTag: 'download_tiles',
+              onPressed: _downloading ? null : _downloadArea,
+              icon: _downloading
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.download_for_offline),
+              label: Text(_downloading ? 'Saving…' : 'Download map'),
             ),
           ),
       ],
@@ -185,7 +340,10 @@ class _HybridMapState extends State<HybridMap> {
       myLocationEnabled: true,
       myLocationButtonEnabled: true,
       mapType: gmaps.MapType.hybrid,
-      onMapCreated: (c) => _gCtrl = c,
+      onMapCreated: (c) {
+        _gCtrl = c;
+        WidgetsBinding.instance.addPostFrameCallback((_) => _fitGoogle());
+      },
       onTap: widget.onTap == null
           ? null
           : (p) => widget.onTap!(ll.LatLng(p.latitude, p.longitude)),
@@ -198,13 +356,14 @@ class _HybridMapState extends State<HybridMap> {
       options: MapOptions(
         initialCenter: widget.center,
         initialZoom: widget.initialZoom,
+        onMapReady: _fitOsm,
         onTap: widget.onTap == null
             ? null
             : (tap, latlng) => widget.onTap!(latlng),
       ),
       children: [
         TileLayer(
-          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          urlTemplate: OfflineTileProvider.cartoVoyagerUrl,
           tileProvider: OfflineTileProvider(),
           userAgentPackageName: 'com.pathfinder.sadc',
         ),
@@ -267,7 +426,7 @@ class _HybridMapState extends State<HybridMap> {
           ],
         ),
         SimpleAttributionWidget(
-          source: const Text('OpenStreetMap'),
+          source: const Text('© OSM / CARTO'),
           onTap: () =>
               launchUrl(Uri.parse('https://openstreetmap.org/copyright')),
         ),
@@ -293,11 +452,13 @@ class _MapModeBanner extends StatelessWidget {
   final bool usingGoogle;
   final bool hasKey;
   final VoidCallback onToggleOsm;
+  final VoidCallback onMissingKey;
 
   const _MapModeBanner({
     required this.usingGoogle,
     required this.hasKey,
     required this.onToggleOsm,
+    required this.onMissingKey,
   });
 
   @override
@@ -307,13 +468,12 @@ class _MapModeBanner extends StatelessWidget {
     String subtitle;
     if (usingGoogle) {
       title = 'Google Maps';
-      subtitle = 'Tap to use offline OSM cache';
+      subtitle = 'Tap to use offline cached basemap';
     } else if (!hasKey) {
-      title = 'Offline OSM map';
-      subtitle =
-          'No Google Maps API key — coords + external maps still work. See README.';
+      title = 'Offline basemap (Carto/OSM)';
+      subtitle = 'No Google key — tap for details. Download map for bush use.';
     } else {
-      title = 'Offline OSM (cached tiles)';
+      title = 'Offline basemap (cached)';
       subtitle = 'Tap to switch to Google Maps';
     }
 
@@ -323,7 +483,9 @@ class _MapModeBanner extends StatelessWidget {
       color: cs.surface.withValues(alpha: 0.94),
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
-        onTap: hasKey || usingGoogle ? onToggleOsm : null,
+        onTap: !hasKey && !usingGoogle
+            ? onMissingKey
+            : (hasKey || usingGoogle ? onToggleOsm : onMissingKey),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           child: Row(

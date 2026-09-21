@@ -7,6 +7,7 @@ import '../../core/path_guidance.dart';
 import '../../services/area_audit.dart';
 import '../../services/external_maps.dart';
 import '../../services/plot_calculator.dart';
+import '../../services/gps_service.dart';
 import '../../services/plot_exporter.dart';
 import '../pathfinder/guidance_screen.dart';
 import '../pathfinder/pathfinder_screen.dart';
@@ -75,17 +76,20 @@ class _PlotMapScreenState extends State<PlotMapScreen> {
             Text('Lat ${pt.latitude.toStringAsFixed(7)}'),
             Text('Lon ${pt.longitude.toStringAsFixed(7)}'),
             Text(
-                'Lo Y ${lo.westing.toStringAsFixed(0)}  X ${lo.southing.toStringAsFixed(0)}'),
+                'Lo Y ${lo.westing.toStringAsFixed(3)}  X ${lo.southing.toStringAsFixed(3)}'),
             const SizedBox(height: 12),
             FilledButton.icon(
-              
-              onPressed: () {
+              onPressed: () async {
                 Navigator.pop(ctx);
-                Navigator.push(
-                  context,
+                // Use current GPS as start (same as Plot Finder); never start==end.
+                final nav = Navigator.of(this.context);
+                final gps = await GpsService.currentLatLng(this.context);
+                if (!mounted) return;
+                final start = gps ?? pt;
+                nav.push(
                   MaterialPageRoute(
                     builder: (_) => GuidanceScreen(
-                      start: pt,
+                      start: start,
                       end: pt,
                       startLabel: 'You',
                       endLabel: 'C${idx + 1}',

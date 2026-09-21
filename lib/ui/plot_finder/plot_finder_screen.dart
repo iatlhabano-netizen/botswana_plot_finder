@@ -3,18 +3,21 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/lo_converter.dart';
+import '../../core/lo_format.dart';
+import '../../core/polygon_validation.dart';
 import '../../services/external_maps.dart';
+import '../../services/gps_service.dart';
 import '../../services/ocr_service.dart';
 import '../../services/plot_manager.dart';
 import '../license/license_screen.dart';
 import '../pathfinder/guidance_screen.dart';
 import '../pathfinder/pathfinder_screen.dart';
 import '../theme.dart';
+import '../widgets/ocr_review_sheet.dart';
 import 'plot_map_screen.dart';
 
 class _CornerCtrls {
@@ -45,17 +48,27 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
   final List<_CornerCtrls> _corners = [];
   final OcrService _ocr = OcrService();
   bool _scanning = false;
+  bool _gpsStarting = false;
   double? _declaredHa;
   StreamSubscription<Position>? _gpsSub;
   ll.LatLng? _currentPos;
+  double? _gpsAccuracy;
   List<PlotProject> _projects = [];
   PlotProject? _active;
+  bool _advancedOpen = false;
+
+  static const _sampleCorners = [
+    ('-74283', '2609149'),
+    ('-74593', '2609153'),
+    ('-74589', '2609473'),
+    ('-74279', '2609469'),
+  ];
 
   @override
   void initState() {
     super.initState();
+    // Do NOT start GPS in initState — wait for user tap (locate / use my position).
     _restore();
-    _startGps();
   }
 
   @override
@@ -68,26 +81,40 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
     super.dispose();
   }
 
-  Future<void> _startGps() async {
-    if (!await Geolocator.isLocationServiceEnabled()) return;
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-    }
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) {
-      return;
-    }
-    _gpsSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
+  Future<void> _ensureGps() async {
+    if (_gpsSub != null) return;
+    setState(() => _gpsStarting = true);
+    try {
+      if (!await GpsService.ensurePermission(context)) return;
+      final seed = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      if (mounted) {
+        setState(() {
+          _currentPos = ll.LatLng(seed.latitude, seed.longitude);
+          _gpsAccuracy = seed.accuracy;
+        });
+      }
+      _gpsSub = GpsService.watch(
         accuracy: LocationAccuracy.high,
         distanceFilter: 5,
-      ),
-    ).listen((pos) {
+      ).listen((pos) {
+        if (mounted) {
+          setState(() {
+            _currentPos = ll.LatLng(pos.latitude, pos.longitude);
+            _gpsAccuracy = pos.accuracy;
+          });
+        }
+      });
+    } catch (_) {
       if (mounted) {
-        setState(() => _currentPos = ll.LatLng(pos.latitude, pos.longitude));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not get GPS fix yet.')),
+        );
       }
-    });
+    } finally {
+      if (mounted) setState(() => _gpsStarting = false);
+    }
   }
 
   Future<void> _restore() async {
@@ -99,7 +126,7 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
     final activeId = await PlotManager.activeId();
     _active = _projects.where((p) => p.id == activeId).firstOrNull;
 
-    if (_active != null) {
+    if (_active != null && _active!.corners.isNotEmpty) {
       _corners.clear();
       for (final c in _active!.corners) {
         _corners.add(_CornerCtrls(c['y'] ?? '', c['x'] ?? ''));
@@ -107,14 +134,24 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
       _zone = int.tryParse(_active!.zone) ?? _zone;
       _datum = _active!.datumKey;
     } else if (_corners.isEmpty) {
-      _corners.addAll([
-        _CornerCtrls('-74283', '2609149'),
-        _CornerCtrls('-74593', '2609153'),
-        _CornerCtrls('-74589', '2609473'),
-        _CornerCtrls('-74279', '2609469'),
-      ]);
+      // Empty first launch — Sample only behind explicit button (match Area Calculator).
+      _corners.add(_CornerCtrls('', ''));
     }
     if (mounted) setState(() {});
+  }
+
+  void _fillSample() {
+    for (final c in _corners) {
+      c.dispose();
+    }
+    _corners
+      ..clear()
+      ..addAll([
+        for (final s in _sampleCorners) _CornerCtrls(s.$1, s.$2),
+      ]);
+    setState(() {});
+    _persist();
+    _toast('Sample Lo25 Cape plot loaded — review before navigating.');
   }
 
   Future<void> _persist() async {
@@ -150,121 +187,62 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
     return out;
   }
 
+  List<Map<String, double>> get _loCorners => [
+        for (final c in _corners)
+          if (c.westing != null && c.southing != null)
+            {'Y': c.westing!, 'X': c.southing!}
+      ];
+
   void _toast(String m) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
   }
 
   Future<void> _scan() async {
-    final source = await showModalBottomSheet<ImageSource>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(
-            leading: const Icon(Icons.photo_camera),
-            title: const Text('Photograph certificate / notes'),
-            onTap: () => Navigator.pop(ctx, ImageSource.camera),
-          ),
-          ListTile(
-            leading: const Icon(Icons.photo_library),
-            title: const Text('Choose from gallery'),
-            onTap: () => Navigator.pop(ctx, ImageSource.gallery),
-          ),
-        ]),
-      ),
-    );
-    if (source == null || !mounted) return;
-
     setState(() => _scanning = true);
     try {
-      final result = await _ocr.scan(source);
-      if (!mounted) return;
-      if (result == null) return;
-      if (result.pairs.isEmpty) {
-        _toast('No coordinates found. Try better lighting or clearer numbers.');
-        return;
-      }
-
-      final action = await showDialog<String>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: Text('${result.pairs.length} coordinate(s) found'),
-          content: SizedBox(
-            width: double.maxFinite,
-            height: 220,
-            child: ListView.builder(
-              itemCount: result.pairs.length,
-              itemBuilder: (_, i) {
-                final p = result.pairs[i];
-                return ListTile(
-                  dense: true,
-                  leading: CircleAvatar(
-                    radius: 12,
-                    backgroundColor: PathfinderTheme.seed,
-                    child: Text('${i + 1}',
-                        style: const TextStyle(
-                            color: Colors.white, fontSize: 11)),
-                  ),
-                  title: Text(
-                      'Y ${p.westing.toStringAsFixed(0)}   X ${p.southing.toStringAsFixed(0)}'),
-                );
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel')),
-            TextButton(
-                onPressed: () => Navigator.pop(ctx, 'append'),
-                child: const Text('Append')),
-            FilledButton(
-                onPressed: () => Navigator.pop(ctx, 'replace'),
-                child: const Text('Replace')),
-          ],
-        ),
-      );
-      if (action == null || !mounted) return;
-
+      final outcome =
+          await OcrReviewFlow.scanAndReview(context: context, ocr: _ocr);
+      if (outcome == null || !mounted) return;
       setState(() {
-        if (action == 'replace') {
+        if (outcome.action == 'replace') {
           for (final c in _corners) {
             c.dispose();
           }
           _corners.clear();
         }
-        for (final p in result.pairs) {
+        for (final p in outcome.pairs) {
           _corners.add(_CornerCtrls(
-            p.westing.toStringAsFixed(0),
-            p.southing.toStringAsFixed(0),
+            formatLoCoord(p.westing),
+            formatLoCoord(p.southing),
           ));
         }
-        if (result.declaredHectares != null) {
-          _declaredHa = result.declaredHectares;
+        if (outcome.declaredHectares != null) {
+          _declaredHa = outcome.declaredHectares;
         }
       });
       await _persist();
-      _toast('${result.pairs.length} corner(s) loaded');
-    } on OcrException catch (e) {
-      _toast(e.message);
-    } catch (e) {
-      _toast('Scan failed. Try another photo or check camera/gallery permissions.');
-      debugPrint('Plot Finder scan error: $e');
+      _toast('${outcome.pairs.length} corner(s) accepted');
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
   }
 
   void _openMap() {
+    final lo = _loCorners;
+    final issues = PolygonValidation.validateLoCorners(lo);
+    final blocking = issues.where((i) => i.blocking).toList();
+    if (blocking.isNotEmpty) {
+      _toast(blocking.map((i) => i.message).join('\n'));
+      return;
+    }
+    if (issues.isNotEmpty) {
+      _toast(issues.map((i) => i.message).join('\n'));
+    }
     final pts = _points;
     if (pts.length < 2) {
       _toast('Enter at least two valid corners.');
       return;
     }
-    final lo = [
-      for (final c in _corners)
-        if (c.westing != null && c.southing != null)
-          {'Y': c.westing!, 'X': c.southing!}
-    ];
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -275,6 +253,33 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
           datumKey: _datum,
           declaredHa: _declaredHa,
           projectName: _active?.name,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _locateCorner(int idx) async {
+    final c = _corners[idx];
+    final w = c.westing;
+    final s = c.southing;
+    if (w == null || s == null) {
+      _toast('Enter valid Y/X first');
+      return;
+    }
+    await _ensureGps();
+    if (!mounted) return;
+    final pt = LoConverter.toWgs84(
+        westing: w, southing: s, zone: _zone, datumKey: _datum);
+    final start = _currentPos ?? pt;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GuidanceScreen(
+          start: start,
+          end: pt,
+          startLabel: 'You',
+          endLabel: 'C${idx + 1}',
+          locateMode: true,
         ),
       ),
     );
@@ -308,30 +313,19 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
             Text('Corner ${idx + 1}',
                 style: Theme.of(context).textTheme.titleLarge),
             const SizedBox(height: 8),
-            Text('Lo  Y ${w.toStringAsFixed(0)}  X ${s.toStringAsFixed(0)}'),
+            Text('Lo  Y ${formatLoCoord(w)}  X ${formatLoCoord(s)}'),
             Text(
-                'WGS84  ${pt.latitude.toStringAsFixed(7)}, ${pt.longitude.toStringAsFixed(7)}'),
+                'GPS  ${pt.latitude.toStringAsFixed(7)}, ${pt.longitude.toStringAsFixed(7)}'),
             if (warn != null) ...[
               const SizedBox(height: 8),
               Text(warn, style: TextStyle(color: Colors.orange.shade800)),
             ],
             const SizedBox(height: 16),
             FilledButton.icon(
+              style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
               onPressed: () {
                 Navigator.pop(ctx);
-                final start = _currentPos ?? pt;
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => GuidanceScreen(
-                      start: start,
-                      end: pt,
-                      startLabel: 'You',
-                      endLabel: 'C${idx + 1}',
-                      locateMode: true,
-                    ),
-                  ),
-                );
+                _locateCorner(idx);
               },
               icon: const Icon(Icons.my_location),
               label: const Text('Locate this corner'),
@@ -340,24 +334,7 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
             OutlinedButton.icon(
               onPressed: () {
                 Navigator.pop(ctx);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => PlotMapScreen(
-                      points: _points,
-                      loCorners: [
-                        for (final c in _corners)
-                          if (c.westing != null && c.southing != null)
-                            {'Y': c.westing!, 'X': c.southing!}
-                      ],
-                      zone: _zone,
-                      datumKey: _datum,
-                      declaredHa: _declaredHa,
-                      projectName: _active?.name,
-                      focusIndex: idx,
-                    ),
-                  ),
-                );
+                _openMap();
               },
               icon: const Icon(Icons.map),
               label: const Text('Show on plot map'),
@@ -386,7 +363,7 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                 );
               },
               icon: const Icon(Icons.explore),
-              label: const Text('Pathfinder setup…'),
+              label: const Text('Walk a line setup…'),
             ),
             const SizedBox(height: 8),
             TextButton.icon(
@@ -412,8 +389,12 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
     final datums = LoConverter.availableDatums(_country.id);
     return Scaffold(
       appBar: AppBar(
-        title: Text(_active?.name ?? 'Plot Finder'),
+        title: Text(_active?.name ?? 'Find my plot'),
         actions: [
+          TextButton(
+            onPressed: _fillSample,
+            child: const Text('Sample', style: TextStyle(color: Colors.white)),
+          ),
           IconButton(
             tooltip: 'License',
             icon: const Icon(Icons.verified_outlined),
@@ -439,7 +420,21 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          if (_currentPos != null)
+          OutlinedButton.icon(
+            onPressed: _gpsStarting ? null : _ensureGps,
+            icon: _gpsStarting
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.gps_fixed),
+            label: Text(_currentPos == null
+                ? 'Use my position (GPS)'
+                : 'GPS on · ${GpsService.accuracyLabel(_gpsAccuracy)}'),
+          ),
+          if (_currentPos != null) ...[
+            const SizedBox(height: 8),
             Card(
               color: Theme.of(context).colorScheme.primaryContainer,
               child: Padding(
@@ -447,10 +442,10 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Current GPS',
+                    const Text('Current position',
                         style: TextStyle(fontWeight: FontWeight.bold)),
                     Text(
-                        'WGS84  ${_currentPos!.latitude.toStringAsFixed(6)}, ${_currentPos!.longitude.toStringAsFixed(6)}'),
+                        '${_currentPos!.latitude.toStringAsFixed(6)}, ${_currentPos!.longitude.toStringAsFixed(6)}'),
                     Builder(builder: (_) {
                       final lo = LoConverter.fromWgs84(
                         _currentPos!,
@@ -458,78 +453,85 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                         datumKey: _datum,
                       );
                       return Text(
-                          'Lo  Y ${lo.westing.toStringAsFixed(0)}  X ${lo.southing.toStringAsFixed(0)}');
+                          'Lo  Y ${formatLoCoord(lo.westing)}  X ${formatLoCoord(lo.southing)}');
                     }),
                   ],
                 ),
               ),
             ),
+          ],
           const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(children: [
-                DropdownButtonFormField<CountrySystem>(
-                  value: _country,
-                  decoration: const InputDecoration(
-                      labelText: 'Country', border: OutlineInputBorder()),
-                  items: LoConverter.supportedCountries
-                      .map((c) => DropdownMenuItem(
-                          value: c, child: Text('${c.label} (${c.id})')))
-                      .toList(),
-                  onChanged: (v) {
-                    if (v == null) return;
-                    setState(() {
-                      _country = v;
-                      _zone = v.availableZones.contains(_zone)
-                          ? _zone
-                          : v.availableZones.first;
-                      _datum = v.defaultDatum;
-                    });
-                    _persist();
-                  },
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<int>(
-                  value: _country.availableZones.contains(_zone)
-                      ? _zone
-                      : _country.availableZones.first,
-                  decoration: const InputDecoration(
-                      labelText: 'Lo Central Meridian',
-                      border: OutlineInputBorder()),
-                  items: _country.availableZones
-                      .map((z) =>
-                          DropdownMenuItem(value: z, child: Text('Lo$z')))
-                      .toList(),
-                  onChanged: (v) {
-                    setState(() => _zone = v!);
-                    _persist();
-                  },
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<String>(
-                  value: datums.any((d) => d.key == _datum)
-                      ? _datum
-                      : datums.first.key,
-                  decoration: const InputDecoration(
-                      labelText: 'Datum', border: OutlineInputBorder()),
-                  items: datums
-                      .map((d) =>
-                          DropdownMenuItem(value: d.key, child: Text(d.label)))
-                      .toList(),
-                  onChanged: (v) {
-                    setState(() => _datum = v!);
-                    _persist();
-                  },
-                ),
-              ]),
-            ),
+          ExpansionTile(
+            title: const Text('Country / Lo zone / datum'),
+            subtitle: Text('${_country.label} · Lo$_zone'),
+            initiallyExpanded: _advancedOpen,
+            onExpansionChanged: (v) => setState(() => _advancedOpen = v),
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+                child: Column(children: [
+                  DropdownButtonFormField<CountrySystem>(
+                    value: _country,
+                    decoration: const InputDecoration(
+                        labelText: 'Country', border: OutlineInputBorder()),
+                    items: LoConverter.supportedCountries
+                        .map((c) => DropdownMenuItem(
+                            value: c, child: Text('${c.label} (${c.id})')))
+                        .toList(),
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() {
+                        _country = v;
+                        _zone = v.availableZones.contains(_zone)
+                            ? _zone
+                            : v.availableZones.first;
+                        _datum = v.defaultDatum;
+                      });
+                      _persist();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<int>(
+                    value: _country.availableZones.contains(_zone)
+                        ? _zone
+                        : _country.availableZones.first,
+                    decoration: const InputDecoration(
+                        labelText: 'Lo central meridian',
+                        border: OutlineInputBorder()),
+                    items: _country.availableZones
+                        .map((z) =>
+                            DropdownMenuItem(value: z, child: Text('Lo$z')))
+                        .toList(),
+                    onChanged: (v) {
+                      setState(() => _zone = v!);
+                      _persist();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    value: datums.any((d) => d.key == _datum)
+                        ? _datum
+                        : datums.first.key,
+                    decoration: const InputDecoration(
+                        labelText: 'Datum', border: OutlineInputBorder()),
+                    items: datums
+                        .map((d) => DropdownMenuItem(
+                            value: d.key, child: Text(d.label)))
+                        .toList(),
+                    onChanged: (v) {
+                      setState(() => _datum = v!);
+                      _persist();
+                    },
+                  ),
+                ]),
+              ),
+            ],
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
-                child: Text('Corners (Y westing / X southing)',
+                child: Text('Corners',
                     style: Theme.of(context).textTheme.titleMedium),
               ),
               TextButton.icon(
@@ -544,95 +546,80 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
           ),
           ...List.generate(_corners.length, (idx) {
             return Card(
-              margin: const EdgeInsets.symmetric(vertical: 4),
+              margin: const EdgeInsets.symmetric(vertical: 6),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 8, 4, 8),
-                child: Row(
+                padding: const EdgeInsets.fromLTRB(12, 12, 8, 12),
+                child: Column(
                   children: [
-                    CircleAvatar(
-                      radius: 16,
-                      backgroundColor: PathfinderTheme.seed,
-                      child: Text('${idx + 1}',
-                          style: const TextStyle(color: Colors.white)),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _corners[idx].y,
-                        keyboardType: const TextInputType.numberWithOptions(
-                            signed: true, decimal: true),
-                        decoration: const InputDecoration(
-                          labelText: 'Y',
-                          isDense: true,
-                          border: OutlineInputBorder(),
+                    Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 16,
+                          backgroundColor: PathfinderTheme.seed,
+                          child: Text('${idx + 1}',
+                              style: const TextStyle(color: Colors.white)),
                         ),
-                        onChanged: (_) => _persist(),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: TextField(
-                        controller: _corners[idx].x,
-                        keyboardType: const TextInputType.numberWithOptions(
-                            signed: true, decimal: true),
-                        decoration: const InputDecoration(
-                          labelText: 'X',
-                          isDense: true,
-                          border: OutlineInputBorder(),
+                        const SizedBox(width: 8),
+                        Text('Corner ${idx + 1}',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600)),
+                        const Spacer(),
+                        IconButton(
+                          tooltip: 'More',
+                          icon: const Icon(Icons.more_vert),
+                          onPressed: () => _showCornerActions(idx),
                         ),
-                        onChanged: (_) => _persist(),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: _corners.length <= 1
+                              ? null
+                              : () {
+                                  setState(() {
+                                    _corners.removeAt(idx).dispose();
+                                  });
+                                  _persist();
+                                },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _corners[idx].y,
+                      keyboardType: const TextInputType.numberWithOptions(
+                          signed: true, decimal: true),
+                      decoration: const InputDecoration(
+                        labelText: 'Y (Westing)',
+                        border: OutlineInputBorder(),
                       ),
+                      onChanged: (_) => _persist(),
                     ),
-                    IconButton(
-                      tooltip: 'Locate this corner',
-                      icon: const Icon(Icons.my_location, color: PathfinderTheme.accent),
-                      onPressed: () {
-                        final c = _corners[idx];
-                        final w = c.westing;
-                        final s = c.southing;
-                        if (w == null || s == null) {
-                          _toast('Enter valid Y/X first');
-                          return;
-                        }
-                        final pt = LoConverter.toWgs84(
-                          westing: w, southing: s, zone: _zone, datumKey: _datum);
-                        final start = _currentPos ?? pt;
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => GuidanceScreen(
-                              start: start,
-                              end: pt,
-                              startLabel: 'You',
-                              endLabel: 'C${idx + 1}',
-                              locateMode: true,
-                            ),
-                          ),
-                        );
-                      },
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _corners[idx].x,
+                      keyboardType: const TextInputType.numberWithOptions(
+                          signed: true, decimal: true),
+                      decoration: const InputDecoration(
+                        labelText: 'X (Southing)',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (_) => _persist(),
                     ),
-                    IconButton(
-                      tooltip: 'More actions',
-                      icon: const Icon(Icons.more_vert),
-                      onPressed: () => _showCornerActions(idx),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.delete_outline),
-                      onPressed: _corners.length <= 1
-                          ? null
-                          : () {
-                              setState(() {
-                                _corners.removeAt(idx).dispose();
-                              });
-                              _persist();
-                            },
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: FilledButton.icon(
+                        onPressed: () => _locateCorner(idx),
+                        icon: const Icon(Icons.my_location, size: 22),
+                        label: const Text('Locate this corner'),
+                      ),
                     ),
                   ],
                 ),
               ),
             );
           }),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           FilledButton.icon(
             onPressed: _openMap,
             icon: const Icon(Icons.map),
@@ -640,19 +627,19 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
           ),
           const SizedBox(height: 10),
           OutlinedButton.icon(
-            onPressed: _scan,
+            onPressed: _scanning ? null : _scan,
             icon: const Icon(Icons.document_scanner),
             label: const Text('Scan Land Board certificate / notes'),
           ),
-          const SizedBox(height: 10),
-          if (_points.isNotEmpty)
+          if (_points.isNotEmpty) ...[
+            const SizedBox(height: 12),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Converted WGS84',
+                    Text('Converted positions',
                         style: Theme.of(context).textTheme.titleSmall),
                     const SizedBox(height: 6),
                     ..._points.asMap().entries.map((e) => Text(
@@ -663,6 +650,7 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                 ),
               ),
             ),
+          ],
           const SizedBox(height: 40),
         ],
       ),

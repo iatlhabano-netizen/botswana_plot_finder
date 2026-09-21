@@ -35,7 +35,7 @@ class HomeHub extends StatelessWidget {
                     const Expanded(
                       child: BrandHeader(
                         subtitle:
-                            'SADC Lo → GPS · plot awards · bush navigation',
+                            'Find your plot · walk a line · calculate area',
                         logoSize: 68,
                       ),
                     ),
@@ -62,7 +62,7 @@ class HomeHub extends StatelessWidget {
                   PfSpace.lg, PfSpace.md, PfSpace.lg, PfSpace.xl),
               sliver: SliverList.list(children: [
                 Text(
-                  'Field tools',
+                  'Outdoors',
                   style: tt.titleSmall?.copyWith(
                     color: cs.onSurfaceVariant,
                     letterSpacing: 0.6,
@@ -72,10 +72,11 @@ class HomeHub extends StatelessWidget {
                 _HubCard(
                   icon: Icons.grid_on_rounded,
                   tint: PfColors.forest,
-                  title: 'Plot Finder',
+                  title: 'Find my plot',
                   subtitle:
-                      'Convert Lo corners to WGS84, scan certificates, and map the plot. Tap any corner → Locate this corner.',
-                  cta: 'Open Plot Finder',
+                      'Enter or scan Land Board corners, then walk to any beacon. '
+                      'Tap Locate this corner when you are in the field.',
+                  cta: 'Open Find my plot',
                   onTap: () => Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -86,10 +87,11 @@ class HomeHub extends StatelessWidget {
                 _HubCard(
                   icon: Icons.explore_rounded,
                   tint: PfColors.sandGoldDeep,
-                  title: 'Pathfinder',
+                  title: 'Walk a line',
                   subtitle:
-                      'Two endpoints (GPS, WGS84, or Lo). Straight geodesic cutline with live left/right guidance — or locate one pole from GPS.',
-                  cta: 'Open Pathfinder',
+                      'Pick two points (or find one corner from where you stand). '
+                      'Live left/right guidance across open bush.',
+                  cta: 'Open Walk a line',
                   onTap: () => Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -100,10 +102,11 @@ class HomeHub extends StatelessWidget {
                 _HubCard(
                   icon: Icons.square_foot_rounded,
                   tint: PfColors.sky,
-                  title: 'Area Calculator',
+                  title: 'Calculate area',
                   subtitle:
-                      'Enter Lo corners (3+) for plot area in hectares and m², plus fence-line lengths. Includes certificate scan.',
-                  cta: 'Open Area Calculator',
+                      'Three or more corners → hectares, m², and fence lengths. '
+                      'Compare calculated area to the certificate.',
+                  cta: 'Open Calculate area',
                   onTap: () => Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -245,10 +248,10 @@ class _TipsCard extends StatelessWidget {
           ),
           const SizedBox(height: PfSpace.sm),
           Text(
-            '• First visit: open a map online so OSM tiles cache for remote areas.\n'
-            '• Google Maps needs MAPS_API_KEY in local.properties (see README).\n'
-            '• Without a key, use the coordinate list + Open in Maps / Locate guidance.\n'
-            '• To find your plot: open Plot Finder → tap a corner → Locate this corner.',
+            '• Before you leave signal: open your plot map and tap Download map.\n'
+            '• No Google Maps key? The offline basemap still works — tap the banner for details.\n'
+            '• To find a beacon: Find my plot → Locate this corner (uses your GPS).\n'
+            '• Advanced: Lo zone and datum live under each tool’s Country / zone section.',
             style: tt.bodyMedium?.copyWith(
               color: cs.onSurfaceVariant,
               height: 1.5,
@@ -276,7 +279,7 @@ class _AboutStrip extends StatelessWidget {
               Text('Pathfinder',
                   style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
               Text(
-                'Survey-grade Lo tools for SADC field work',
+                'Field tools for SADC plot awards and bush navigation',
                 style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
               ),
             ],

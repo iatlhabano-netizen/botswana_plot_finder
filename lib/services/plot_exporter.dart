@@ -1,8 +1,16 @@
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+
+String _xmlEscape(String s) => s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
 
 class PlotExporter {
   /// Generates a standard KML file containing corner placemarks and the boundary polygon
@@ -11,7 +19,7 @@ class PlotExporter {
     buffer.writeln('<?xml version="1.0" encoding="UTF-8"?>');
     buffer.writeln('<kml xmlns="http://www.opengis.net/kml/2.2">');
     buffer.writeln('  <Document>');
-    buffer.writeln('    <name>$plotName</name>');
+    buffer.writeln('    <name>${_xmlEscape(plotName)}</name>');
 
     for (int i = 0; i < points.length; i++) {
       final pt = points[i];
@@ -25,7 +33,7 @@ class PlotExporter {
 
     if (points.length >= 3) {
       buffer.writeln('    <Placemark>');
-      buffer.writeln('      <name>$plotName Boundary</name>');
+      buffer.writeln('      <name>${_xmlEscape(plotName)} Boundary</name>');
       buffer.writeln('      <Style>');
       buffer.writeln('        <LineStyle><color>ff0000ff</color><width>3</width></LineStyle>');
       buffer.writeln('        <PolyStyle><color>3f0000ff</color></PolyStyle>');
@@ -66,7 +74,7 @@ class PlotExporter {
 
     if (points.length >= 2) {
       buffer.writeln('  <trk>');
-      buffer.writeln('    <name>$plotName Perimeter</name>');
+      buffer.writeln('    <name>${_xmlEscape(plotName)} Perimeter</name>');
       buffer.writeln('    <trkseg>');
       for (final pt in points) {
         buffer.writeln('      <trkpt lat="${pt.latitude}" lon="${pt.longitude}"/>');

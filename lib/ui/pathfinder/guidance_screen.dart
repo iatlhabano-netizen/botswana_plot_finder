@@ -6,8 +6,10 @@ import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/path_guidance.dart';
+import '../../services/gps_service.dart';
 import '../theme.dart';
 import '../widgets/hybrid_map.dart';
 
@@ -43,72 +45,116 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
   ll.LatLng? _cur;
   double _xt = 0;
   double _distRemain = 0;
-  double _targetBearing = 0;
-  double _heading = 0;
+  double _targetBearingTrue = 0;
+  double _headingMag = 0;
+  double? _accuracyM;
+  double? _compassAccuracy;
   bool _gpsFix = false;
   bool _overshoot = false;
   bool _permissionDenied = false;
+  bool _arrived = false;
+  bool? _wasOnPath;
   String? _error;
+  final List<double> _headingBuf = [];
 
   @override
   void initState() {
     super.initState();
-    _targetBearing = PathGuidance.bearingDeg(widget.start, widget.end);
+    _targetBearingTrue = PathGuidance.bearingDeg(widget.start, widget.end);
     _distRemain = PathGuidance.distanceM(widget.start, widget.end);
+    // First paint uses real start→end distance (never force 0 m).
+    WakelockPlus.enable();
     _startGps();
     _startCompass();
   }
 
   Future<void> _startGps() async {
     try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        setState(() => _error = 'Turn on location services.');
-        return;
-      }
-      var perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
-      }
-      if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) {
-        setState(() => _permissionDenied = true);
+      if (!await GpsService.ensurePermission(context)) {
+        if (mounted) setState(() => _permissionDenied = true);
         return;
       }
 
-      _gpsSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.bestForNavigation,
-          distanceFilter: 1,
-        ),
-      ).listen((pos) {
-        final cur = ll.LatLng(pos.latitude, pos.longitude);
-        final start = widget.locateMode ? cur : widget.start;
-        setState(() {
-          _cur = cur;
-          _gpsFix = true;
-          _xt = widget.locateMode
-              ? 0
-              : PathGuidance.crossTrackM(cur, widget.start, widget.end);
-          _distRemain = PathGuidance.distanceM(cur, widget.end);
-          _targetBearing = PathGuidance.bearingDeg(start, widget.end);
-          _overshoot = widget.locateMode
-              ? false
-              : PathGuidance.isPastEnd(cur, widget.start, widget.end);
-        });
-      });
+      // Seed with a current fix so locate mode does not flash 0 m from start==end.
+      try {
+        final seed = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation,
+        );
+        if (mounted) _onPos(seed);
+      } catch (_) {}
+
+      _gpsSub = GpsService.watch(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 1,
+      ).listen(_onPos);
     } catch (e) {
-      setState(() => _error = 'GPS error: $e');
+      if (mounted) setState(() => _error = 'GPS error: $e');
     }
+  }
+
+  void _onPos(Position pos) {
+    final cur = ll.LatLng(pos.latitude, pos.longitude);
+    final start = widget.locateMode ? cur : widget.start;
+    final xt = widget.locateMode
+        ? 0.0
+        : PathGuidance.crossTrackM(cur, widget.start, widget.end);
+    final dist = PathGuidance.distanceM(cur, widget.end);
+    final bearing = PathGuidance.bearingDeg(start, widget.end);
+    final overshoot = widget.locateMode
+        ? false
+        : PathGuidance.isPastEnd(cur, widget.start, widget.end);
+    final arrivalR = PathGuidance.arrivalRadiusM(pos.accuracy);
+    final arrived = dist <= arrivalR;
+    final onPath = !overshoot &&
+        (widget.locateMode
+            ? PathGuidance.signedTurnDeg(
+                      _headingMag,
+                      PathGuidance.trueToMagnetic(bearing),
+                    ).abs() <=
+                20
+            : xt.abs() <= 1.5);
+
+    // Haptics on transitions
+    if (_wasOnPath != null && _wasOnPath != onPath && !arrived) {
+      HapticFeedback.lightImpact();
+    }
+    if (!_arrived && arrived) {
+      HapticFeedback.mediumImpact();
+    }
+    _wasOnPath = onPath;
+
+    if (!mounted) return;
+    setState(() {
+      _cur = cur;
+      _gpsFix = true;
+      _accuracyM = pos.accuracy;
+      _xt = xt;
+      _distRemain = dist;
+      _targetBearingTrue = bearing;
+      _overshoot = overshoot;
+      _arrived = arrived;
+    });
   }
 
   void _startCompass() {
     _compassSub = FlutterCompass.events?.listen((event) {
-      if (mounted) setState(() => _heading = event.heading ?? 0);
+      final h = event.heading;
+      if (h == null) return;
+      _headingBuf.add(h);
+      if (_headingBuf.length > 7) _headingBuf.removeAt(0);
+      final smoothed = PathGuidance.smoothHeading(_headingBuf);
+      if (mounted) {
+        setState(() {
+          _headingMag = smoothed;
+          _compassAccuracy = event.accuracy;
+        });
+      }
     });
   }
 
   @override
   void dispose() {
+    WakelockPlus.disable();
     _gpsSub?.cancel();
     _compassSub?.cancel();
     super.dispose();
@@ -116,25 +162,27 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final onTrack = !_overshoot && _xt.abs() <= 1.5;
-    final arrived = _gpsFix && _distRemain <= 3.0;
+    final arrivalR = PathGuidance.arrivalRadiusM(_accuracyM);
     final statusText = !_gpsFix
         ? 'Acquiring GPS…'
-        : arrived
-            ? 'ARRIVED'
+        : _arrived
+            ? 'ARRIVED (±${arrivalR.toStringAsFixed(0)} m)'
             : _overshoot
                 ? 'PASSED TARGET — TURN BACK'
-                : widget.locateMode
-                    ? 'HEAD TO TARGET'
-                    : PathGuidance.crossTrackMessage(_xt);
+                : PathGuidance.headingAwareMessage(
+                    headingMagDeg: _headingMag,
+                    desiredTrueBearingDeg: _targetBearingTrue,
+                    xtM: widget.locateMode ? null : _xt,
+                  );
 
+    final onPath = statusText == 'ON PATH';
     final statusColor = !_gpsFix
         ? Colors.grey
-        : arrived
+        : _arrived
             ? Colors.green
             : _overshoot
                 ? Colors.orange
-                : (widget.locateMode || onTrack)
+                : onPath
                     ? Colors.green
                     : Colors.red;
 
@@ -142,21 +190,39 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         ? (_cur != null ? [_cur!, widget.end] : [widget.start, widget.end])
         : [widget.start, widget.end];
 
+    final magTarget =
+        PathGuidance.trueToMagnetic(_targetBearingTrue);
+    final needsCalib =
+        _compassAccuracy != null && _compassAccuracy! < 0; // platform-dependent
+
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.locateMode
             ? 'Locate ${widget.endLabel}'
             : '${widget.startLabel} → ${widget.endLabel}'),
         actions: [
-          IconButton(
-            tooltip: 'Keep screen on',
-            icon: const Icon(Icons.screen_lock_portrait),
-            onPressed: () {
-              SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Immersive mode — swipe top to exit')),
-              );
-            },
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Center(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: GpsService.accuracyColor(_accuracyM).withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                      color: GpsService.accuracyColor(_accuracyM)),
+                ),
+                child: Text(
+                  GpsService.accuracyLabel(_accuracyM),
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: _darken(GpsService.accuracyColor(_accuracyM)),
+                  ),
+                ),
+              ),
+            ),
           ),
         ],
       ),
@@ -169,6 +235,8 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
               initialZoom: 16,
               polyline: line,
               userLocation: _cur,
+              fitToFeatures: true,
+              showDownloadButton: false,
               markers: [
                 if (!widget.locateMode)
                   MapMarkerData(
@@ -201,13 +269,13 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                               statusText,
                               textAlign: TextAlign.center,
                               style: TextStyle(
-                                fontSize: 28,
+                                fontSize: 26,
                                 fontWeight: FontWeight.w800,
                                 color: _darken(statusColor),
                                 letterSpacing: 0.5,
                               ),
                             ),
-                            const SizedBox(height: 12),
+                            const SizedBox(height: 8),
                             Text(
                               '${_distRemain.toStringAsFixed(1)} m',
                               style: const TextStyle(
@@ -227,21 +295,48 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                                     .onSurfaceVariant,
                               ),
                             ),
-                            const SizedBox(height: 16),
+                            const SizedBox(height: 12),
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                               children: [
-                                _metric('Bearing',
-                                    '${_targetBearing.toStringAsFixed(0)}°'),
-                                _metric('Heading',
-                                    '${_heading.toStringAsFixed(0)}°'),
+                                _metric('Bearing (true)',
+                                    '${_targetBearingTrue.toStringAsFixed(0)}°'),
+                                _metric('Mag target',
+                                    '${magTarget.toStringAsFixed(0)}°'),
+                                _metric('Heading (mag)',
+                                    '${_headingMag.toStringAsFixed(0)}°'),
                                 if (!widget.locateMode)
                                   _metric(
                                       'XT', '${_xt.abs().toStringAsFixed(1)} m'),
                               ],
                             ),
-                            const SizedBox(height: 16),
-                            if (_gpsFix) _compassRose(),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Compass is magnetic · path bearing is true '
+                              '(Botswana declination ≈ 13° W)',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
+                              ),
+                            ),
+                            if (needsCalib ||
+                                (_compassAccuracy != null &&
+                                    (_compassAccuracy!).abs() > 30))
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6),
+                                child: Text(
+                                  'Compass accuracy looks poor — wave the phone in a figure-8 to calibrate.',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.orange.shade800),
+                                ),
+                              ),
+                            const SizedBox(height: 12),
+                            if (_gpsFix) _compassRose(magTarget),
                             if (!_gpsFix)
                               const Padding(
                                 padding: EdgeInsets.all(24),
@@ -256,26 +351,37 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     );
   }
 
-  Widget _permDenied() => const Padding(
-        padding: EdgeInsets.all(24),
-        child: Text(
-          'Location permission is required for live guidance.\n\nOpen system settings and allow precise location for Pathfinder.',
-          textAlign: TextAlign.center,
+  Widget _permDenied() => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'Location permission is required for live guidance.\n\n'
+              'Open system settings and allow precise location for Pathfinder.',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: () => Geolocator.openAppSettings(),
+              child: const Text('Open app settings'),
+            ),
+          ],
         ),
       );
 
   Widget _metric(String label, String value) => Column(
         children: [
           Text(label,
-              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              style: const TextStyle(fontSize: 10, color: Colors.grey)),
           Text(value,
               style:
-                  const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         ],
       );
 
-  Widget _compassRose() {
-    final headingDiff = (_heading - _targetBearing + 360) % 360;
+  Widget _compassRose(double magTarget) {
+    final headingDiff = (_headingMag - magTarget + 360) % 360;
     final aligned = headingDiff < 8 || headingDiff > 352;
     return SizedBox(
       width: 140,
@@ -284,7 +390,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         alignment: Alignment.center,
         children: [
           Transform.rotate(
-            angle: -_heading * pi / 180,
+            angle: -_headingMag * pi / 180,
             child: Container(
               width: 130,
               height: 130,
@@ -311,7 +417,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
             ),
           ),
           Transform.rotate(
-            angle: (_targetBearing - _heading) * pi / 180,
+            angle: (magTarget - _headingMag) * pi / 180,
             child: Icon(Icons.navigation,
                 size: 48,
                 color: aligned ? Colors.green : PathfinderTheme.sky),

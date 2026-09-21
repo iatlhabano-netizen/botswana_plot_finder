@@ -56,6 +56,14 @@ void main() {
     });
   });
 
+  test('parses decimal Y/X from certificate-style text', () {
+      const text = 'Y = -74283.25  X = 2609149.50';
+      final pairs = OcrService.parseLoCoordinates(text);
+      expect(pairs, isNotEmpty);
+      expect(pairs.first.westing, closeTo(-74283.25, 1e-9));
+      expect(pairs.first.southing, closeTo(2609149.50, 1e-9));
+    });
+
   group('OcrException', () {
     test('toString is the user message', () {
       const e = OcrException('Image file is missing or empty after save. Please try again.');

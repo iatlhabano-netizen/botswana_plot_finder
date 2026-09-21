@@ -1,7 +1,7 @@
 name: botswana_plot_finder
 description: Pathfinder — SADC Lo coordinate converter, plot finder, area calculator, and bush path guidance
 publish_to: 'none'
-version: 4.2.0+4
+version: 4.3.0+5
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -22,6 +22,8 @@ dependencies:
   shared_preferences: ^2.2.3
   flutter_compass: ^0.8.1
   flutter_cache_manager: ^3.4.2
+  wakelock_plus: ^1.2.8
+  http: ^1.2.2
 
 dev_dependencies:
   flutter_test:
