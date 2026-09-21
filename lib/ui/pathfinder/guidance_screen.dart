@@ -8,10 +8,14 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../../core/distance_format.dart';
 import '../../core/path_guidance.dart';
+import '../../services/external_maps.dart';
 import '../../services/gps_service.dart';
 import '../theme.dart';
 import '../widgets/hybrid_map.dart';
+
+enum _LocateUiMode { directions, straightLine }
 
 /// Live line-following / single-point locate guidance (outdoor UI).
 class GuidanceScreen extends StatefulWidget {
@@ -57,15 +61,28 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
   String? _error;
   final List<double> _headingBuf = [];
 
+  /// User locked a mode via the segmented control; otherwise auto from distance.
+  bool _modeLocked = false;
+  _LocateUiMode _mode = _LocateUiMode.straightLine;
+
   @override
   void initState() {
     super.initState();
     _targetBearingTrue = PathGuidance.bearingDeg(widget.start, widget.end);
-    _distRemain = PathGuidance.distanceM(widget.start, widget.end);
+    _distRemain = widget.pathLengthM ??
+        PathGuidance.distanceM(widget.start, widget.end);
+    _applyAutoMode();
     // First paint uses real start→end distance (never force 0 m).
     WakelockPlus.enable();
     _startGps();
     _startCompass();
+  }
+
+  void _applyAutoMode() {
+    if (_modeLocked) return;
+    _mode = DistanceFormat.preferRoadDirections(_distRemain)
+        ? _LocateUiMode.directions
+        : _LocateUiMode.straightLine;
   }
 
   Future<void> _startGps() async {
@@ -133,6 +150,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
       _targetBearingTrue = bearing;
       _overshoot = overshoot;
       _arrived = arrived;
+      _applyAutoMode();
     });
   }
 
@@ -149,6 +167,17 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
           _compassAccuracy = event.accuracy;
         });
       }
+    });
+  }
+
+  Future<void> _openMaps() async {
+    await ExternalMaps.openNavigation(widget.end);
+  }
+
+  void _setMode(_LocateUiMode m) {
+    setState(() {
+      _modeLocked = true;
+      _mode = m;
     });
   }
 
@@ -190,10 +219,11 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         ? (_cur != null ? [_cur!, widget.end] : [widget.start, widget.end])
         : [widget.start, widget.end];
 
-    final magTarget =
-        PathGuidance.trueToMagnetic(_targetBearingTrue);
+    final magTarget = PathGuidance.trueToMagnetic(_targetBearingTrue);
     final needsCalib =
         _compassAccuracy != null && _compassAccuracy! < 0; // platform-dependent
+    final farAway = DistanceFormat.preferRoadDirections(_distRemain);
+    final distLabel = DistanceFormat.format(_distRemain);
 
     return Scaffold(
       appBar: AppBar(
@@ -208,10 +238,11 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 decoration: BoxDecoration(
-                  color: GpsService.accuracyColor(_accuracyM).withValues(alpha: 0.2),
+                  color:
+                      GpsService.accuracyColor(_accuracyM).withValues(alpha: 0.2),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                      color: GpsService.accuracyColor(_accuracyM)),
+                  border:
+                      Border.all(color: GpsService.accuracyColor(_accuracyM)),
                 ),
                 child: Text(
                   GpsService.accuracyLabel(_accuracyM),
@@ -257,95 +288,271 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
             child: Container(
               width: double.infinity,
               color: Theme.of(context).colorScheme.surface,
-              padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
               child: _permissionDenied
                   ? _permDenied()
                   : _error != null
-                      ? Center(child: Text(_error!, textAlign: TextAlign.center))
+                      ? Center(
+                          child: Text(_error!, textAlign: TextAlign.center))
                       : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Text(
-                              statusText,
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 26,
-                                fontWeight: FontWeight.w800,
-                                color: _darken(statusColor),
-                                letterSpacing: 0.5,
-                              ),
+                            SegmentedButton<_LocateUiMode>(
+                              segments: const [
+                                ButtonSegment(
+                                  value: _LocateUiMode.directions,
+                                  label: Text('Directions'),
+                                  icon: Icon(Icons.directions_car, size: 18),
+                                ),
+                                ButtonSegment(
+                                  value: _LocateUiMode.straightLine,
+                                  label: Text('Straight line'),
+                                  icon: Icon(Icons.explore, size: 18),
+                                ),
+                              ],
+                              selected: {_mode},
+                              onSelectionChanged: (s) => _setMode(s.first),
                             ),
                             const SizedBox(height: 8),
-                            Text(
-                              '${_distRemain.toStringAsFixed(1)} m',
-                              style: const TextStyle(
-                                fontSize: 48,
-                                fontWeight: FontWeight.bold,
-                                fontFeatures: [FontFeature.tabularFigures()],
-                              ),
+                            Expanded(
+                              child: _mode == _LocateUiMode.directions
+                                  ? _directionsPane(distLabel, farAway)
+                                  : _straightLinePane(
+                                      statusText,
+                                      statusColor,
+                                      distLabel,
+                                      magTarget,
+                                      needsCalib,
+                                      farAway,
+                                    ),
                             ),
-                            Text(
-                              widget.locateMode
-                                  ? 'to ${widget.endLabel}'
-                                  : 'to endpoint',
-                              style: TextStyle(
-                                fontSize: 16,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                              children: [
-                                _metric('Bearing (true)',
-                                    '${_targetBearingTrue.toStringAsFixed(0)}°'),
-                                _metric('Mag target',
-                                    '${magTarget.toStringAsFixed(0)}°'),
-                                _metric('Heading (mag)',
-                                    '${_headingMag.toStringAsFixed(0)}°'),
-                                if (!widget.locateMode)
-                                  _metric(
-                                      'XT', '${_xt.abs().toStringAsFixed(1)} m'),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              'Compass is magnetic · path bearing is true '
-                              '(Botswana declination ≈ 13° W)',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurfaceVariant,
-                              ),
-                            ),
-                            if (needsCalib ||
-                                (_compassAccuracy != null &&
-                                    (_compassAccuracy!).abs() > 30))
-                              Padding(
-                                padding: const EdgeInsets.only(top: 6),
-                                child: Text(
-                                  'Compass accuracy looks poor — wave the phone in a figure-8 to calibrate.',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.orange.shade800),
-                                ),
-                              ),
-                            const SizedBox(height: 12),
-                            if (_gpsFix) _compassRose(magTarget),
-                            if (!_gpsFix)
-                              const Padding(
-                                padding: EdgeInsets.all(24),
-                                child: CircularProgressIndicator(),
-                              ),
                           ],
                         ),
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _directionsPane(String distLabel, bool farAway) {
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(height: 8),
+          Text(
+            distLabel,
+            style: const TextStyle(
+              fontSize: 48,
+              fontWeight: FontWeight.bold,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+          Text(
+            widget.locateMode
+                ? 'straight-line to ${widget.endLabel}'
+                : 'straight-line to endpoint',
+            style: TextStyle(
+              fontSize: 16,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (farAway) ...[
+            Card(
+              color: Theme.of(context).colorScheme.primaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      "You're $distLabel away - get road directions first",
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Drive as close as you can, then switch to Straight line '
+                      'for bush cutline + compass.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: Theme.of(context).colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      onPressed: _openMaps,
+                      icon: const Icon(Icons.map),
+                      label: const Text('Open in Google Maps'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextButton(
+                      onPressed: () =>
+                          _setMode(_LocateUiMode.straightLine),
+                      child: const Text('Use straight-line guidance anyway'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ] else ...[
+            FilledButton.icon(
+              onPressed: _openMaps,
+              icon: const Icon(Icons.map),
+              label: const Text('Open in Google Maps'),
+              style: FilledButton.styleFrom(
+                minimumSize: const Size.fromHeight(48),
+              ),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: () => _setMode(_LocateUiMode.straightLine),
+              child: const Text('Switch to straight-line guidance'),
+            ),
+          ],
+          const SizedBox(height: 12),
+          Text(
+            'Opens turn-by-turn navigation to the target coordinates. '
+            'Does not replace in-app bush guidance.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _straightLinePane(
+    String statusText,
+    Color statusColor,
+    String distLabel,
+    double magTarget,
+    bool needsCalib,
+    bool farAway,
+  ) {
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (farAway) ...[
+            Card(
+              color: Colors.orange.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      "You're $distLabel away - get road directions first",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.orange.shade900,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    FilledButton.icon(
+                      onPressed: _openMaps,
+                      icon: const Icon(Icons.map, size: 18),
+                      label: const Text('Open in Google Maps'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.orange.shade800,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _setMode(_LocateUiMode.directions),
+                      child: const Text('Switch to Directions mode'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+          Text(
+            statusText,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w800,
+              color: _darken(statusColor),
+              letterSpacing: 0.5,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            distLabel,
+            style: const TextStyle(
+              fontSize: 44,
+              fontWeight: FontWeight.bold,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+          Text(
+            widget.locateMode
+                ? 'to ${widget.endLabel}'
+                : 'to endpoint',
+            style: TextStyle(
+              fontSize: 16,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _metric('Bearing (true)',
+                  '${_targetBearingTrue.toStringAsFixed(0)}°'),
+              _metric('Mag target', '${magTarget.toStringAsFixed(0)}°'),
+              _metric('Heading (mag)', '${_headingMag.toStringAsFixed(0)}°'),
+              if (!widget.locateMode)
+                _metric('XT', '${_xt.abs().toStringAsFixed(1)} m'),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Compass is magnetic · path bearing is true '
+            '(Botswana declination ≈ 13° W)',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          if (needsCalib ||
+              (_compassAccuracy != null && (_compassAccuracy!).abs() > 30))
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Compass accuracy looks poor — wave the phone in a figure-8 to calibrate.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: Colors.orange.shade800),
+              ),
+            ),
+          const SizedBox(height: 8),
+          if (_gpsFix) _compassRose(magTarget),
+          if (!_gpsFix)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: CircularProgressIndicator(),
+            ),
+          if (!farAway) ...[
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: _openMaps,
+              icon: const Icon(Icons.map, size: 18),
+              label: const Text('Open in Google Maps'),
+            ),
+          ],
         ],
       ),
     );

@@ -5,6 +5,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
 import '../../core/lo_converter.dart';
+import '../../core/distance_format.dart';
 import '../../core/path_guidance.dart';
 import '../../services/gps_service.dart';
 import '../theme.dart';
@@ -316,7 +317,7 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
                   children: [
                     Column(children: [
                       const Text('Geodesic'),
-                      Text('${dist.toStringAsFixed(1)} m',
+                      Text(DistanceFormat.format(dist),
                           style: const TextStyle(
                               fontSize: 22, fontWeight: FontWeight.bold)),
                     ]),
