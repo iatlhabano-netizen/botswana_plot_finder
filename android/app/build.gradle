@@ -4,18 +4,26 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader -> localProperties.load(reader) }
+}
+def mapsApiKey = localProperties.getProperty('MAPS_API_KEY', '')
+
 android {
     namespace "com.example.botswana_plot_finder"
-    compileSdk 34
+    compileSdk flutter.compileSdkVersion
     ndkVersion flutter.ndkVersion
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '17'
     }
 
     sourceSets {
@@ -24,15 +32,19 @@ android {
 
     defaultConfig {
         applicationId "com.example.botswana_plot_finder"
-        minSdk 21
-        targetSdk 34
-        versionCode 1
-        versionName "1.0.0"
+        minSdk Math.max(flutter.minSdkVersion as Integer, 21)
+        targetSdk flutter.targetSdkVersion
+        versionCode flutter.versionCode
+        versionName flutter.versionName
+        manifestPlaceholders += [MAPS_API_KEY: mapsApiKey]
     }
 
     buildTypes {
         release {
             signingConfig signingConfigs.debug
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }

@@ -1,4 +1,4 @@
-import 'dart:convert';
+import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 enum LicenseTier {
@@ -26,7 +26,7 @@ class LicenseInfo {
 
 /// Handles feature gating and activation code validation.
 class LicenseService {
-  static const _key = 'license';
+  // license storage keys
   static const _tierKey = 'license_tier';
   static const _expiryKey = 'license_expiry';
 

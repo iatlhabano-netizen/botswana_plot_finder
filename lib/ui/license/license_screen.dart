@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'license_service.dart';
+import '../../services/license_service.dart';
 
 class LicenseScreen extends StatefulWidget {
   const LicenseScreen({super.key});
@@ -47,8 +47,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('License & Activation', style: TextStyle(color: Colors.white)),
-        backgroundColor: const Color(0xFF0070BA),
+        title: const Text('License & Activation'),
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())

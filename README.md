@@ -1,26 +1,43 @@
-# Plot Finder — SADC Multi-Country Land Coordinate Tool
+# Pathfinder — SADC Plot & Bush Navigation
 
-Offline-first Flutter app for Android: convert Gauss Conform Lo coordinates to WGS84, scan Land Board certificates via OCR, plot boundaries on an interactive map with area in hectares, and follow cutlines in the bush with real-time GPS cross-track error guidance.
+Offline-capable Flutter Android app for Botswana / SADC land work:
 
-## Supported Countries & Datums
+1. **Plot Finder** — Lo (Gauss Conform) → WGS84, certificate OCR, map corners, **Locate this corner** live guidance to a single pole  
+2. **Pathfinder** — two endpoints (GPS / WGS84 / Lo), geodesic cutline, cross-track left/right guidance  
+3. **Area Calculator** — dedicated Lo polygon area tool (hectares + m²)
 
-| Country | System / Datum | Central Meridians |
-|---|---|---|
-| Botswana | Cape Datum (Clarke 1880), BTRS02 / WGS84 | Lo21–Lo29 |
-| South Africa | Hartebeesthoek94 (Modern), Cape Datum (Legacy) | Lo17–Lo33 |
-| Namibia | Schwarzeck (Bessel 1841) | Lo11–Lo19 |
-| Zimbabwe | Arc 1950 (Clarke 1880 Modified) | Lo27–Lo33 |
-| Eswatini | Cape Datum (Clarke 1880) | Lo31 |
-| Lesotho | Cape Datum (Clarke 1880) | Lo27–Lo29 |
+## Google Maps API key (optional)
 
-## Features
-- **Lo → WGS84 conversion** — multi-country, multi-datum, dynamic zone selection
-- **On-device OCR** certificate scanning (ML Kit)
-- **Interactive map** with polygon display, area in hectares, corner inspection + Google Maps nav
-- **Bush navigation** with real-time cross-track error guidance (VEER LEFT / VEER RIGHT)
+Do **not** invent or commit secrets. Without a key the app uses **cached OSM** (`flutter_map`) and still shows coordinates + “Open in Maps”.
+
+### Android native key
+
+In `android/local.properties` (local only, gitignored pattern):
+
+```
+MAPS_API_KEY=your_Maps_SDK_for_Android_key
+```
+
+`android/app/build.gradle` injects it into `AndroidManifest` as `com.google.android.geo.API_KEY`.
+
+### Flutter-side (choose Google Maps vs OSM)
+
+Pass the same value at build time:
+
+```bash
+flutter build apk --release --split-per-abi \
+  --dart-define=MAPS_API_KEY="$(grep '^MAPS_API_KEY=' android/local.properties | cut -d= -f2-)"
+```
+
+If `MAPS_API_KEY` is empty, `HybridMap` defaults to offline-friendly OSM.
 
 ## Build
+
 ```bash
 flutter pub get
-flutter run
+flutter build apk --release --split-per-abi
 ```
+
+## Countries / datums
+
+Botswana, South Africa, Namibia, Zimbabwe, Eswatini, Lesotho — Cape / Hartebeesthoek94 / Schwarzeck / Arc 1950 / BTRS02 as applicable.

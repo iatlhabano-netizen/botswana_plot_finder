@@ -1,0 +1,355 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart' as gmaps;
+import 'package:latlong2/latlong.dart' as ll;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../../core/maps_config.dart';
+import '../../services/offline_tile_provider.dart';
+
+class MapMarkerData {
+  final ll.LatLng point;
+  final String label;
+  final Color color;
+  final VoidCallback? onTap;
+  const MapMarkerData({
+    required this.point,
+    required this.label,
+    this.color = Colors.red,
+    this.onTap,
+  });
+}
+
+class HybridMap extends StatefulWidget {
+  final ll.LatLng center;
+  final double initialZoom;
+  final List<ll.LatLng> polygon;
+  final List<ll.LatLng> polyline;
+  final List<MapMarkerData> markers;
+  final ll.LatLng? userLocation;
+  final void Function(ll.LatLng)? onTap;
+  final bool showOfflineBanner;
+
+  const HybridMap({
+    super.key,
+    required this.center,
+    this.initialZoom = 15,
+    this.polygon = const [],
+    this.polyline = const [],
+    this.markers = const [],
+    this.userLocation,
+    this.onTap,
+    this.showOfflineBanner = true,
+  });
+
+  @override
+  State<HybridMap> createState() => _HybridMapState();
+}
+
+class _HybridMapState extends State<HybridMap> {
+  bool _preferOsm = false;
+  bool _loaded = false;
+  gmaps.GoogleMapController? _gCtrl;
+  final MapController _osmCtrl = MapController();
+
+  bool get _useGoogle =>
+      MapsConfig.isGoogleMapsConfigured && !_preferOsm;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPref();
+  }
+
+  Future<void> _loadPref() async {
+    final sp = await SharedPreferences.getInstance();
+    setState(() {
+      _preferOsm = sp.getBool(MapsConfig.preferOsmKey) ?? false;
+      _loaded = true;
+    });
+  }
+
+  Future<void> setPreferOsm(bool v) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setBool(MapsConfig.preferOsmKey, v);
+    setState(() => _preferOsm = v);
+  }
+
+  @override
+  void didUpdateWidget(covariant HybridMap oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.center != widget.center) {
+      _gCtrl?.animateCamera(
+        gmaps.CameraUpdate.newLatLng(
+          gmaps.LatLng(widget.center.latitude, widget.center.longitude),
+        ),
+      );
+      try {
+        _osmCtrl.move(widget.center, _osmCtrl.camera.zoom);
+      } catch (_) {}
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_loaded) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Stack(
+      children: [
+        if (_useGoogle) _buildGoogle() else _buildOsm(),
+        if (widget.showOfflineBanner)
+          Positioned(
+            top: 8,
+            left: 8,
+            right: 8,
+            child: _MapModeBanner(
+              usingGoogle: _useGoogle,
+              hasKey: MapsConfig.isGoogleMapsConfigured,
+              onToggleOsm: () => setPreferOsm(!_preferOsm),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildGoogle() {
+    final poly = widget.polygon.length >= 3
+        ? {
+            gmaps.Polygon(
+              polygonId: const gmaps.PolygonId('plot'),
+              points: widget.polygon
+                  .map((p) => gmaps.LatLng(p.latitude, p.longitude))
+                  .toList(),
+              strokeWidth: 3,
+              strokeColor: const Color(0xFF0B6E4F),
+              fillColor: const Color(0xFF0B6E4F).withValues(alpha: 0.2),
+            )
+          }
+        : <gmaps.Polygon>{};
+
+    final line = widget.polyline.length >= 2
+        ? {
+            gmaps.Polyline(
+              polylineId: const gmaps.PolylineId('path'),
+              points: widget.polyline
+                  .map((p) => gmaps.LatLng(p.latitude, p.longitude))
+                  .toList(),
+              width: 5,
+              color: const Color(0xFFE85D04),
+            )
+          }
+        : <gmaps.Polyline>{};
+
+    final markers = <gmaps.Marker>{};
+    for (var i = 0; i < widget.markers.length; i++) {
+      final m = widget.markers[i];
+      markers.add(
+        gmaps.Marker(
+          markerId: gmaps.MarkerId('m$i'),
+          position: gmaps.LatLng(m.point.latitude, m.point.longitude),
+          infoWindow: gmaps.InfoWindow(title: m.label),
+          onTap: m.onTap,
+          icon: gmaps.BitmapDescriptor.defaultMarkerWithHue(
+            _hueFor(m.color),
+          ),
+        ),
+      );
+    }
+    if (widget.userLocation != null) {
+      markers.add(
+        gmaps.Marker(
+          markerId: const gmaps.MarkerId('me'),
+          position: gmaps.LatLng(
+            widget.userLocation!.latitude,
+            widget.userLocation!.longitude,
+          ),
+          icon: gmaps.BitmapDescriptor.defaultMarkerWithHue(
+            gmaps.BitmapDescriptor.hueAzure,
+          ),
+          infoWindow: const gmaps.InfoWindow(title: 'You'),
+        ),
+      );
+    }
+
+    return gmaps.GoogleMap(
+      initialCameraPosition: gmaps.CameraPosition(
+        target: gmaps.LatLng(widget.center.latitude, widget.center.longitude),
+        zoom: widget.initialZoom,
+      ),
+      polygons: poly,
+      polylines: line,
+      markers: markers,
+      myLocationEnabled: true,
+      myLocationButtonEnabled: true,
+      mapType: gmaps.MapType.hybrid,
+      onMapCreated: (c) => _gCtrl = c,
+      onTap: widget.onTap == null
+          ? null
+          : (p) => widget.onTap!(ll.LatLng(p.latitude, p.longitude)),
+    );
+  }
+
+  Widget _buildOsm() {
+    return FlutterMap(
+      mapController: _osmCtrl,
+      options: MapOptions(
+        initialCenter: widget.center,
+        initialZoom: widget.initialZoom,
+        onTap: widget.onTap == null
+            ? null
+            : (tap, latlng) => widget.onTap!(latlng),
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          tileProvider: OfflineTileProvider(),
+          userAgentPackageName: 'com.pathfinder.sadc',
+        ),
+        if (widget.polygon.length >= 3)
+          PolygonLayer(polygons: [
+            Polygon(
+              points: widget.polygon,
+              color: const Color(0xFF0B6E4F).withValues(alpha: 0.2),
+              borderColor: const Color(0xFF0B6E4F),
+              borderStrokeWidth: 3,
+            ),
+          ]),
+        if (widget.polyline.length >= 2)
+          PolylineLayer(polylines: [
+            Polyline(
+              points: widget.polyline,
+              color: const Color(0xFFE85D04),
+              strokeWidth: 5,
+            ),
+          ]),
+        MarkerLayer(
+          markers: [
+            ...widget.markers.map(
+              (m) => Marker(
+                point: m.point,
+                width: 72,
+                height: 72,
+                child: GestureDetector(
+                  onTap: m.onTap,
+                  child: Column(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 4, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: Colors.black26),
+                        ),
+                        child: Text(
+                          m.label,
+                          style: const TextStyle(
+                              fontSize: 10, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      Icon(Icons.location_pin, color: m.color, size: 34),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (widget.userLocation != null)
+              Marker(
+                point: widget.userLocation!,
+                width: 40,
+                height: 40,
+                child: const Icon(Icons.my_location,
+                    color: Colors.blueAccent, size: 28),
+              ),
+          ],
+        ),
+        SimpleAttributionWidget(
+          source: const Text('OpenStreetMap'),
+          onTap: () =>
+              launchUrl(Uri.parse('https://openstreetmap.org/copyright')),
+        ),
+      ],
+    );
+  }
+
+  double _hueFor(Color c) {
+    if (c == Colors.green || c == Colors.greenAccent) {
+      return gmaps.BitmapDescriptor.hueGreen;
+    }
+    if (c == Colors.orange || c == Colors.deepOrange) {
+      return gmaps.BitmapDescriptor.hueOrange;
+    }
+    if (c == Colors.blue || c == Colors.blueAccent) {
+      return gmaps.BitmapDescriptor.hueAzure;
+    }
+    return gmaps.BitmapDescriptor.hueRed;
+  }
+}
+
+class _MapModeBanner extends StatelessWidget {
+  final bool usingGoogle;
+  final bool hasKey;
+  final VoidCallback onToggleOsm;
+
+  const _MapModeBanner({
+    required this.usingGoogle,
+    required this.hasKey,
+    required this.onToggleOsm,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    String title;
+    String subtitle;
+    if (usingGoogle) {
+      title = 'Google Maps';
+      subtitle = 'Tap to use offline OSM cache';
+    } else if (!hasKey) {
+      title = 'Offline OSM map';
+      subtitle =
+          'No Google Maps API key — coords + external maps still work. See README.';
+    } else {
+      title = 'Offline OSM (cached tiles)';
+      subtitle = 'Tap to switch to Google Maps';
+    }
+
+    return Material(
+      elevation: 2,
+      borderRadius: BorderRadius.circular(10),
+      color: cs.surface.withValues(alpha: 0.94),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: hasKey || usingGoogle ? onToggleOsm : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                usingGoogle ? Icons.map : Icons.offline_pin,
+                color: cs.primary,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 13)),
+                    Text(subtitle,
+                        style: TextStyle(
+                            fontSize: 11, color: cs.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
