@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
@@ -11,8 +12,14 @@ import '../../services/gps_service.dart';
 import '../theme.dart';
 import '../widgets/hybrid_map.dart';
 import 'guidance_screen.dart';
+import 'saved_waypoints_sheet.dart';
 
-enum _PointSource { gps, wgs84, lo }
+enum _PointSource { gps, wgs84, lo, map }
+
+enum _MapTapMode { setStart, setEnd, pan }
+
+/// Default map center — roughly central Botswana.
+const _kDefaultCenter = ll.LatLng(-22.3285, 24.6849);
 
 class PathfinderScreen extends StatefulWidget {
   final ll.LatLng? initialStart;
@@ -33,8 +40,9 @@ class PathfinderScreen extends StatefulWidget {
 }
 
 class _PathfinderScreenState extends State<PathfinderScreen> {
-  _PointSource _startSrc = _PointSource.gps;
+  _PointSource _startSrc = _PointSource.wgs84;
   _PointSource _endSrc = _PointSource.wgs84;
+  _MapTapMode _mapMode = _MapTapMode.pan;
 
   final _startLat = TextEditingController();
   final _startLon = TextEditingController();
@@ -50,9 +58,14 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
   CountrySystem _country = LoConverter.supportedCountries.first;
 
   ll.LatLng? _gps;
+  double? _gpsAccuracyM;
   StreamSubscription<Position>? _gpsSub;
   String? _startName;
   String? _endName;
+  /// Explicit map-placed / GPS-assigned points (override when source is map/gps).
+  ll.LatLng? _startMap;
+  ll.LatLng? _endMap;
+  int _fitToken = 0;
 
   @override
   void initState() {
@@ -61,24 +74,30 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     _endName = widget.endLabel;
     if (widget.initialStart != null) {
       _startSrc = _PointSource.wgs84;
+      _startMap = widget.initialStart;
       _startLat.text = widget.initialStart!.latitude.toStringAsFixed(7);
       _startLon.text = widget.initialStart!.longitude.toStringAsFixed(7);
     }
     if (widget.initialEnd != null) {
       _endSrc = _PointSource.wgs84;
+      _endMap = widget.initialEnd;
       _endLat.text = widget.initialEnd!.latitude.toStringAsFixed(7);
       _endLon.text = widget.initialEnd!.longitude.toStringAsFixed(7);
     }
-    // GPS starts when user selects GPS source or taps locate — not in initState.
   }
 
   Future<void> _startGps() async {
     if (_gpsSub != null) return;
     if (!await GpsService.ensurePermission(context)) return;
     try {
-      final pos = await Geolocator.getCurrentPosition();
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.bestForNavigation,
+      );
       if (mounted) {
-        setState(() => _gps = ll.LatLng(pos.latitude, pos.longitude));
+        setState(() {
+          _gps = ll.LatLng(pos.latitude, pos.longitude);
+          _gpsAccuracyM = pos.accuracy;
+        });
       }
     } catch (_) {}
     _gpsSub = GpsService.watch(
@@ -86,7 +105,10 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
       distanceFilter: 5,
     ).listen((pos) {
       if (mounted) {
-        setState(() => _gps = ll.LatLng(pos.latitude, pos.longitude));
+        setState(() {
+          _gps = ll.LatLng(pos.latitude, pos.longitude);
+          _gpsAccuracyM = pos.accuracy;
+        });
       }
     });
   }
@@ -95,8 +117,14 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
   void dispose() {
     _gpsSub?.cancel();
     for (final c in [
-      _startLat, _startLon, _endLat, _endLon,
-      _startY, _startX, _endY, _endX,
+      _startLat,
+      _startLon,
+      _endLat,
+      _endLon,
+      _startY,
+      _startX,
+      _endY,
+      _endX,
     ]) {
       c.dispose();
     }
@@ -109,15 +137,22 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     required TextEditingController lon,
     required TextEditingController y,
     required TextEditingController x,
-    required bool isStart,
+    required ll.LatLng? mapPt,
   }) {
     switch (src) {
       case _PointSource.gps:
         return _gps;
+      case _PointSource.map:
+        return mapPt;
       case _PointSource.wgs84:
+        if (mapPt != null &&
+            lat.text.trim().isEmpty &&
+            lon.text.trim().isEmpty) {
+          return mapPt;
+        }
         final la = double.tryParse(lat.text.trim());
         final lo = double.tryParse(lon.text.trim());
-        if (la == null || lo == null) return null;
+        if (la == null || lo == null) return mapPt;
         return ll.LatLng(la, lo);
       case _PointSource.lo:
         final w = double.tryParse(y.text.trim());
@@ -138,7 +173,7 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         lon: _startLon,
         y: _startY,
         x: _startX,
-        isStart: true,
+        mapPt: _startMap,
       );
 
   ll.LatLng? get _end => _resolve(
@@ -147,11 +182,192 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         lon: _endLon,
         y: _endY,
         x: _endX,
-        isStart: false,
+        mapPt: _endMap,
       );
 
   void _toast(String m) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  void _applyPoint({
+    required bool isStart,
+    required ll.LatLng pt,
+    required _PointSource src,
+    String? name,
+    double? loY,
+    double? loX,
+  }) {
+    setState(() {
+      if (isStart) {
+        _startSrc = src;
+        _startMap = pt;
+        _startName = name;
+        _startLat.text = pt.latitude.toStringAsFixed(7);
+        _startLon.text = pt.longitude.toStringAsFixed(7);
+        if (loY != null) _startY.text = loY.toStringAsFixed(3);
+        if (loX != null) _startX.text = loX.toStringAsFixed(3);
+      } else {
+        _endSrc = src;
+        _endMap = pt;
+        _endName = name;
+        _endLat.text = pt.latitude.toStringAsFixed(7);
+        _endLon.text = pt.longitude.toStringAsFixed(7);
+        if (loY != null) _endY.text = loY.toStringAsFixed(3);
+        if (loX != null) _endX.text = loX.toStringAsFixed(3);
+      }
+      _fitToken++;
+    });
+  }
+
+  void _onMapTap(ll.LatLng pt) {
+    if (_mapMode == _MapTapMode.pan) return;
+    final isStart = _mapMode == _MapTapMode.setStart;
+    _applyPoint(isStart: isStart, pt: pt, src: _PointSource.map);
+    _toast(isStart ? 'Start placed on map' : 'End placed on map');
+  }
+
+  Future<void> _useGpsAs(bool isStart) async {
+    await _startGps();
+    if (_gps == null) {
+      _toast('Waiting for GPS fix…');
+      return;
+    }
+    _applyPoint(
+      isStart: isStart,
+      pt: _gps!,
+      src: _PointSource.gps,
+      name: 'My GPS',
+    );
+    _toast(isStart ? 'Start = my GPS' : 'End = my GPS');
+  }
+
+  Future<void> _showMyLocation() async {
+    await _startGps();
+    if (_gps == null) {
+      _toast('Waiting for GPS fix…');
+      return;
+    }
+    final acc = _gpsAccuracyM != null
+        ? ' (±${_gpsAccuracyM!.toStringAsFixed(0)} m)'
+        : '';
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('My location'),
+        content: SelectableText(
+          '${_gps!.latitude.toStringAsFixed(7)}, '
+          '${_gps!.longitude.toStringAsFixed(7)}$acc',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(
+                text:
+                    '${_gps!.latitude.toStringAsFixed(7)}, ${_gps!.longitude.toStringAsFixed(7)}',
+              ));
+              if (ctx.mounted) Navigator.pop(ctx);
+              _toast('GPS coordinates copied');
+            },
+            child: const Text('Copy'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await promptAndSaveWaypoint(
+                context,
+                lat: _gps!.latitude,
+                lng: _gps!.longitude,
+                suggestedLabel: 'My GPS',
+              );
+            },
+            child: const Text('Save'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _copyCoords(ll.LatLng? pt, String which) async {
+    if (pt == null) {
+      _toast('No $which point to copy.');
+      return;
+    }
+    final text =
+        '${pt.latitude.toStringAsFixed(7)}, ${pt.longitude.toStringAsFixed(7)}';
+    await Clipboard.setData(ClipboardData(text: text));
+    _toast('$which coordinates copied');
+  }
+
+  Future<void> _copyMyGps() async {
+    await _startGps();
+    if (_gps == null) {
+      _toast('Waiting for GPS fix…');
+      return;
+    }
+    await _copyCoords(_gps, 'GPS');
+  }
+
+  Future<void> _savePoint({
+    required ll.LatLng? pt,
+    required String suggested,
+    bool includeLo = false,
+    TextEditingController? y,
+    TextEditingController? x,
+  }) async {
+    if (pt == null) {
+      _toast('Nothing to save yet.');
+      return;
+    }
+    double? loY;
+    double? loX;
+    if (includeLo && y != null && x != null) {
+      loY = double.tryParse(y.text.trim());
+      loX = double.tryParse(x.text.trim());
+    }
+    await promptAndSaveWaypoint(
+      context,
+      lat: pt.latitude,
+      lng: pt.longitude,
+      suggestedLabel: suggested,
+      loY: loY,
+      loX: loX,
+      zone: (loY != null && loX != null) ? _zone : null,
+      datum: (loY != null && loX != null) ? _datum : null,
+    );
+  }
+
+  void _openSavedPoints() {
+    SavedWaypointsSheet.show(
+      context,
+      onPick: (wp, action) {
+        if (action == WaypointPickAction.useAsStart) {
+          _applyPoint(
+            isStart: true,
+            pt: wp.wgs84,
+            src: _PointSource.wgs84,
+            name: wp.label,
+            loY: wp.loY,
+            loX: wp.loX,
+          );
+          _toast('Start = ${wp.label}');
+        } else if (action == WaypointPickAction.useAsEnd) {
+          _applyPoint(
+            isStart: false,
+            pt: wp.wgs84,
+            src: _PointSource.wgs84,
+            name: wp.label,
+            loY: wp.loY,
+            loX: wp.loX,
+          );
+          _toast('End = ${wp.label}');
+        }
+      },
+    );
+  }
 
   void _startGuidance({bool locateMode = false}) {
     final end = _end;
@@ -161,8 +377,6 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     }
     ll.LatLng start;
     if (locateMode) {
-      // ensure GPS then retry message if still null
-      // (caller should have awaited; we kick off here)
       if (_gps == null) {
         _startGps();
         _toast('Getting GPS — tap Locate again once position appears.');
@@ -196,6 +410,18 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     );
   }
 
+  ll.LatLng get _mapCenter {
+    final s = _start;
+    final e = _end;
+    if (s != null && e != null) {
+      return ll.LatLng(
+        (s.latitude + e.latitude) / 2,
+        (s.longitude + e.longitude) / 2,
+      );
+    }
+    return s ?? e ?? _gps ?? _kDefaultCenter;
+  }
+
   @override
   Widget build(BuildContext context) {
     final start = _start;
@@ -207,18 +433,166 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         ? PathGuidance.bearingDeg(start, end)
         : null;
 
+    final markers = <MapMarkerData>[];
+    if (start != null) {
+      markers.add(MapMarkerData(
+        point: start,
+        label: _startName ?? 'Start',
+        color: Colors.green,
+      ));
+    }
+    if (end != null) {
+      markers.add(MapMarkerData(
+        point: end,
+        label: _endName ?? 'End',
+        color: PathfinderTheme.accent,
+      ));
+    }
+
+    final polyline =
+        (start != null && end != null) ? <ll.LatLng>[start, end] : <ll.LatLng>[];
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Walk a line')),
+      appBar: AppBar(
+        title: const Text('Walk a line'),
+        actions: [
+          IconButton(
+            tooltip: 'Saved points',
+            icon: const Icon(Icons.bookmarks_outlined),
+            onPressed: _openSavedPoints,
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
           Text(
-            'Straight-line bush route between two points. '
-            'Use “Locate from GPS” when you only have one corner pole to find.',
+            'Tap the map to set Start and End, or use GPS / saved points. '
+            'Then follow a straight bush line — or open Directions when far.',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
           ),
+          const SizedBox(height: 12),
+
+          // —— Interactive map ——
+          Text('Map', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          SegmentedButton<_MapTapMode>(
+            segments: const [
+              ButtonSegment(
+                value: _MapTapMode.setStart,
+                label: Text('Set start'),
+                icon: Icon(Icons.flag, size: 16),
+              ),
+              ButtonSegment(
+                value: _MapTapMode.setEnd,
+                label: Text('Set end'),
+                icon: Icon(Icons.flag_outlined, size: 16),
+              ),
+              ButtonSegment(
+                value: _MapTapMode.pan,
+                label: Text('Pan'),
+                icon: Icon(Icons.pan_tool_alt, size: 16),
+              ),
+            ],
+            selected: {_mapMode},
+            onSelectionChanged: (s) => setState(() => _mapMode = s.first),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 280,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: HybridMap(
+                key: ValueKey('pf_map_$_fitToken'),
+                center: _mapCenter,
+                initialZoom: (start != null && end != null) ? 13 : 6.5,
+                polyline: polyline,
+                markers: markers,
+                userLocation: _gps,
+                onTap: _mapMode == _MapTapMode.pan ? null : _onMapTap,
+                fitToFeatures: start != null && end != null,
+                showOfflineBanner: true,
+                showDownloadButton: false,
+              ),
+            ),
+          ),
+          if (_mapMode != _MapTapMode.pan)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                _mapMode == _MapTapMode.setStart
+                    ? 'Tap the map to place or move Start.'
+                    : 'Tap the map to place or move End.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+              ),
+            ),
+          if (start == null && end == null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'No endpoints yet — choose Set start / Set end and tap, '
+                'or use GPS / saved points below.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+              ),
+            ),
+
+          const SizedBox(height: 12),
+          // —— Quick GPS / copy / save actions ——
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _showMyLocation,
+                icon: const Icon(Icons.my_location, size: 18),
+                label: const Text('My location'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _copyMyGps,
+                icon: const Icon(Icons.copy, size: 18),
+                label: const Text('Copy my GPS'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => _savePoint(
+                  pt: _gps,
+                  suggested: 'My GPS',
+                ),
+                icon: const Icon(Icons.bookmark_add_outlined, size: 18),
+                label: const Text('Save GPS'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _openSavedPoints,
+                icon: const Icon(Icons.bookmarks_outlined, size: 18),
+                label: const Text('Saved points'),
+              ),
+            ],
+          ),
+          if (_gps != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  Icon(Icons.gps_fixed,
+                      size: 16, color: GpsService.accuracyColor(_gpsAccuracyM)),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${_gps!.latitude.toStringAsFixed(5)}, '
+                      '${_gps!.longitude.toStringAsFixed(5)}'
+                      '${_gpsAccuracyM != null ? "  ${GpsService.accuracyLabel(_gpsAccuracyM)}" : ""}',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
           const SizedBox(height: 16),
           _endpointCard(
             title: 'Start',
@@ -231,20 +605,49 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
             lon: _startLon,
             y: _startY,
             x: _startX,
+            resolved: start,
+            name: _startName,
+            onUseGps: () => _useGpsAs(true),
+            onCopy: () => _copyCoords(start, 'Start'),
+            onSave: () => _savePoint(
+              pt: start,
+              suggested: _startName ?? 'Start',
+              includeLo: _startSrc == _PointSource.lo,
+              y: _startY,
+              x: _startX,
+            ),
+            onPickSaved: () => _openSavedPoints(),
             useGpsHint: _gps != null
                 ? '${_gps!.latitude.toStringAsFixed(5)}, ${_gps!.longitude.toStringAsFixed(5)}'
-                : 'Acquiring…',
+                : 'Tap “Use my GPS”',
           ),
           const SizedBox(height: 12),
           _endpointCard(
             title: 'End / corner pole',
             source: _endSrc,
-            onSource: (v) => setState(() => _endSrc = v),
+            onSource: (v) {
+              setState(() => _endSrc = v);
+              if (v == _PointSource.gps) _startGps();
+            },
             lat: _endLat,
             lon: _endLon,
             y: _endY,
             x: _endX,
-            useGpsHint: null,
+            resolved: end,
+            name: _endName,
+            onUseGps: () => _useGpsAs(false),
+            onCopy: () => _copyCoords(end, 'End'),
+            onSave: () => _savePoint(
+              pt: end,
+              suggested: _endName ?? 'End',
+              includeLo: _endSrc == _PointSource.lo,
+              y: _endY,
+              x: _endX,
+            ),
+            onPickSaved: () => _openSavedPoints(),
+            useGpsHint: _gps != null
+                ? '${_gps!.latitude.toStringAsFixed(5)}, ${_gps!.longitude.toStringAsFixed(5)}'
+                : 'Tap “Use my GPS”',
           ),
           const SizedBox(height: 12),
           Card(
@@ -254,10 +657,11 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
                 DropdownButtonFormField<CountrySystem>(
                   value: _country,
                   decoration: const InputDecoration(
-                      labelText: 'Country (for Lo)', border: OutlineInputBorder()),
+                      labelText: 'Country (for Lo)',
+                      border: OutlineInputBorder()),
                   items: LoConverter.supportedCountries
-                      .map((c) => DropdownMenuItem(
-                          value: c, child: Text(c.label)))
+                      .map((c) =>
+                          DropdownMenuItem(value: c, child: Text(c.label)))
                       .toList(),
                   onChanged: (v) {
                     if (v == null) return;
@@ -280,8 +684,8 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
                       decoration: const InputDecoration(
                           labelText: 'Lo zone', border: OutlineInputBorder()),
                       items: _country.availableZones
-                          .map((z) => DropdownMenuItem(
-                              value: z, child: Text('Lo$z')))
+                          .map((z) =>
+                              DropdownMenuItem(value: z, child: Text('Lo$z')))
                           .toList(),
                       onChanged: (v) => setState(() => _zone = v!),
                     ),
@@ -331,27 +735,6 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: 12),
-            SizedBox(
-              height: 200,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: HybridMap(
-                  center: start!,
-                  initialZoom: 14,
-                  polyline: [start, end!],
-                  markers: [
-                    MapMarkerData(
-                        point: start, label: 'A', color: Colors.green),
-                    MapMarkerData(
-                        point: end,
-                        label: 'B',
-                        color: PathfinderTheme.accent),
-                  ],
-                  showOfflineBanner: false,
-                ),
-              ),
-            ),
           ],
           const SizedBox(height: 20),
           FilledButton.icon(
@@ -379,6 +762,12 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     required TextEditingController lon,
     required TextEditingController y,
     required TextEditingController x,
+    required ll.LatLng? resolved,
+    required String? name,
+    required VoidCallback onUseGps,
+    required VoidCallback onCopy,
+    required VoidCallback onSave,
+    required VoidCallback onPickSaved,
     required String? useGpsHint,
   }) {
     return Card(
@@ -387,23 +776,55 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(title, style: Theme.of(context).textTheme.titleMedium),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    name != null && name.isNotEmpty ? '$title · $name' : title,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Use my GPS',
+                  onPressed: onUseGps,
+                  icon: const Icon(Icons.gps_fixed),
+                ),
+                IconButton(
+                  tooltip: 'Copy coords',
+                  onPressed: onCopy,
+                  icon: const Icon(Icons.copy),
+                ),
+                IconButton(
+                  tooltip: 'Save as waypoint',
+                  onPressed: onSave,
+                  icon: const Icon(Icons.bookmark_add_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Pick saved',
+                  onPressed: onPickSaved,
+                  icon: const Icon(Icons.bookmarks_outlined),
+                ),
+              ],
+            ),
             const SizedBox(height: 8),
             SegmentedButton<_PointSource>(
-              segments: [
-                if (useGpsHint != null)
-                  const ButtonSegment(
-                      value: _PointSource.gps,
-                      label: Text('GPS'),
-                      icon: Icon(Icons.gps_fixed, size: 16)),
-                const ButtonSegment(
+              segments: const [
+                ButtonSegment(
+                    value: _PointSource.gps,
+                    label: Text('GPS'),
+                    icon: Icon(Icons.gps_fixed, size: 16)),
+                ButtonSegment(
                     value: _PointSource.wgs84,
                     label: Text('WGS84'),
                     icon: Icon(Icons.public, size: 16)),
-                const ButtonSegment(
+                ButtonSegment(
                     value: _PointSource.lo,
                     label: Text('Lo'),
                     icon: Icon(Icons.grid_on, size: 16)),
+                ButtonSegment(
+                    value: _PointSource.map,
+                    label: Text('Map'),
+                    icon: Icon(Icons.map, size: 16)),
               ],
               selected: {source},
               onSelectionChanged: (s) => onSource(s.first),
@@ -411,6 +832,13 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
             const SizedBox(height: 10),
             if (source == _PointSource.gps)
               Text('Using live GPS: ${useGpsHint ?? "…"}')
+            else if (source == _PointSource.map)
+              Text(
+                resolved == null
+                    ? 'Choose “Set start/end” above and tap the map.'
+                    : '${resolved.latitude.toStringAsFixed(6)}, '
+                        '${resolved.longitude.toStringAsFixed(6)}',
+              )
             else if (source == _PointSource.wgs84)
               Row(children: [
                 Expanded(
@@ -460,6 +888,16 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
                   ),
                 ),
               ]),
+            if (resolved != null &&
+                source != _PointSource.wgs84 &&
+                source != _PointSource.map) ...[
+              const SizedBox(height: 6),
+              Text(
+                '→ ${resolved.latitude.toStringAsFixed(6)}, '
+                '${resolved.longitude.toStringAsFixed(6)}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
           ],
         ),
       ),

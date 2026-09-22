@@ -42,6 +42,12 @@ flutter build apk --release --split-per-abi
 
 Botswana, South Africa, Namibia, Zimbabwe, Eswatini, Lesotho — Cape / Hartebeesthoek94 / Schwarzeck / Arc 1950 / BTRS02 as applicable.
 
+## Walk a line / Pathfinder (v4.4+)
+- Interactive map: **Set start** / **Set end** / **Pan** — tap to place endpoints.
+- **My location**, **Copy my GPS**, save GPS/start/end as labeled waypoints.
+- **Saved points** sheet: rename, delete, copy WGS84 (and Lo if stored), use as start/end.
+- Manual WGS84 / Lo entry and guidance (Directions vs Straight line) unchanged.
+
 ## Offline maps (v4.3+)
 - Basemap tiles use **CartoCDN Voyager** (OSM data) with disk cache (~60 days).
 - On any plot/path map, tap **Download map** to prefetch tiles for the current area (padded bbox, z12–16, capped).

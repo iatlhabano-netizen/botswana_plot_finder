@@ -156,9 +156,15 @@ class _HybridMapState extends State<HybridMap> {
   @override
   void didUpdateWidget(covariant HybridMap oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final markersChanged = oldWidget.markers.length != widget.markers.length ||
+        !_samePoints(
+          oldWidget.markers.map((m) => m.point).toList(),
+          widget.markers.map((m) => m.point).toList(),
+        );
     if (oldWidget.center != widget.center ||
         oldWidget.polygon != widget.polygon ||
-        oldWidget.polyline != widget.polyline) {
+        oldWidget.polyline != widget.polyline ||
+        markersChanged) {
       _fitted = false;
       if (!_useGoogle) {
         WidgetsBinding.instance.addPostFrameCallback((_) => _fitOsm());
@@ -166,6 +172,17 @@ class _HybridMapState extends State<HybridMap> {
         _fitGoogle();
       }
     }
+  }
+
+  bool _samePoints(List<ll.LatLng> a, List<ll.LatLng> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].latitude != b[i].latitude ||
+          a[i].longitude != b[i].longitude) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Future<void> _downloadArea() async {
