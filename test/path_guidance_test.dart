@@ -86,4 +86,15 @@ void main() {
     final s = PathGuidance.smoothHeading([359, 1, 0]);
     expect(s, closeTo(0, 2));
   });
+
+  test('stayOnLineMessage ON LINE / LEFT / RIGHT', () {
+    expect(PathGuidance.stayOnLineMessage(0.3), 'ON LINE');
+    expect(PathGuidance.stayOnLineMessage(4.5), contains('RIGHT'));
+    expect(PathGuidance.stayOnLineMessage(-1.7), contains('LEFT'));
+  });
+
+  test('corridorToleranceM expands with accuracy', () {
+    expect(PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 1), closeTo(1.8, 0.01));
+    expect(PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 5), closeTo(3.5, 0.01));
+  });
 }

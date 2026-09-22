@@ -134,6 +134,25 @@ class PathGuidance {
     return (atan2(sy / recent.length, sx / recent.length) * 180 / pi + 360) %
         360;
   }
+
+  /// Stay-on-line hero copy: ON LINE / LEFT x.x m / RIGHT x.x m.
+  /// Sign: +XT = right of path (looking along travel) → message "RIGHT …".
+  static String stayOnLineMessage(double xtM, {double onTrackTolM = 1.5}) {
+    if (xtM.abs() <= onTrackTolM) return 'ON LINE';
+    if (xtM > 0) return 'RIGHT ${xtM.abs().toStringAsFixed(1)} m';
+    return 'LEFT ${xtM.abs().toStringAsFixed(1)} m';
+  }
+
+  /// Widen corridor with GPS accuracy so poor fixes don't false-alarm.
+  /// Default base ~1.8 m; floor expands with ~0.7 × accuracy.
+  static double corridorToleranceM({
+    double baseTolM = 1.8,
+    double? accuracyM,
+    double accuracyFactor = 0.7,
+  }) {
+    final acc = accuracyM ?? 0.0;
+    return max(baseTolM, accuracyFactor * acc);
+  }
 }
 
 /// Alias kept for any leftover references.

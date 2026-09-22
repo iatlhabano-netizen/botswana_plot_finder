@@ -9,15 +9,16 @@ import 'package:latlong2/latlong.dart' as ll;
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/distance_format.dart';
+import '../../core/guided_path.dart';
 import '../../core/path_guidance.dart';
 import '../../services/external_maps.dart';
 import '../../services/gps_service.dart';
 import '../theme.dart';
 import '../widgets/hybrid_map.dart';
 
-enum _LocateUiMode { directions, straightLine }
+enum _LocateUiMode { directions, stayOnLine }
 
-/// Live line-following / single-point locate guidance (outdoor UI).
+/// Live stay-on-line guidance for pipes / fence / utilities (multi-segment OK).
 class GuidanceScreen extends StatefulWidget {
   final ll.LatLng start;
   final ll.LatLng end;
@@ -25,9 +26,15 @@ class GuidanceScreen extends StatefulWidget {
   final String endLabel;
   final double? pathLengthM;
 
-  /// When true, start is "wherever you are" — path is continuously
-  /// GPS → end (locate one corner pole).
+  /// Optional multi-point path (start, vias…, end). When null, uses start+end.
+  final List<PathVertex>? vertices;
+
+  /// When true, start is "wherever you are" — GPS → end (locate one pole).
   final bool locateMode;
+
+  /// When true (Walk the line), default to stay-on-line — do not auto-force
+  /// Google Directions for typical farm distances.
+  final bool preferStayOnLine;
 
   const GuidanceScreen({
     super.key,
@@ -36,8 +43,22 @@ class GuidanceScreen extends StatefulWidget {
     required this.startLabel,
     required this.endLabel,
     this.pathLengthM,
+    this.vertices,
     this.locateMode = false,
+    this.preferStayOnLine = false,
   });
+
+  GuidedPath get path {
+    if (vertices != null && vertices!.length >= 2) {
+      return GuidedPath(vertices!);
+    }
+    return GuidedPath.startEnd(
+      start,
+      end,
+      startLabel: startLabel,
+      endLabel: endLabel,
+    );
+  }
 
   @override
   State<GuidanceScreen> createState() => _GuidanceScreenState();
@@ -49,6 +70,8 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
   ll.LatLng? _cur;
   double _xt = 0;
   double _distRemain = 0;
+  double _alongPath = 0;
+  double _totalPath = 0;
   double _targetBearingTrue = 0;
   double _headingMag = 0;
   double? _accuracyM;
@@ -57,22 +80,36 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
   bool _overshoot = false;
   bool _permissionDenied = false;
   bool _arrived = false;
-  bool? _wasOnPath;
+  bool? _wasOnLine;
   String? _error;
+  String _segmentLabel = '';
   final List<double> _headingBuf = [];
 
-  /// User locked a mode via the segmented control; otherwise auto from distance.
   bool _modeLocked = false;
-  _LocateUiMode _mode = _LocateUiMode.straightLine;
+  _LocateUiMode _mode = _LocateUiMode.stayOnLine;
+
+  /// User-adjustable base corridor (m); widened further by GPS accuracy.
+  double _baseTolM = 1.8;
+
+  late GuidedPath _path;
 
   @override
   void initState() {
     super.initState();
+    _path = widget.path;
+    _totalPath = widget.pathLengthM ?? _path.totalLengthM;
+    _distRemain = _totalPath;
     _targetBearingTrue = PathGuidance.bearingDeg(widget.start, widget.end);
-    _distRemain = widget.pathLengthM ??
-        PathGuidance.distanceM(widget.start, widget.end);
-    _applyAutoMode();
-    // First paint uses real start→end distance (never force 0 m).
+    _segmentLabel = _path.segmentCount > 0 ? _path.segmentLabel(0) : '';
+
+    if (widget.preferStayOnLine || !widget.locateMode) {
+      // Walk the line → stay-on-line first (no auto Directions).
+      _mode = _LocateUiMode.stayOnLine;
+      _modeLocked = true;
+    } else {
+      _applyAutoMode();
+    }
+
     WakelockPlus.enable();
     _startGps();
     _startCompass();
@@ -82,7 +119,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     if (_modeLocked) return;
     _mode = DistanceFormat.preferRoadDirections(_distRemain)
         ? _LocateUiMode.directions
-        : _LocateUiMode.straightLine;
+        : _LocateUiMode.stayOnLine;
   }
 
   Future<void> _startGps() async {
@@ -92,7 +129,6 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         return;
       }
 
-      // Seed with a current fix so locate mode does not flash 0 m from start==end.
       try {
         final seed = await Geolocator.getCurrentPosition(
           desiredAccuracy: LocationAccuracy.bestForNavigation,
@@ -109,36 +145,62 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     }
   }
 
+  double get _tol => PathGuidance.corridorToleranceM(
+        baseTolM: _baseTolM,
+        accuracyM: _accuracyM,
+      );
+
   void _onPos(Position pos) {
     final cur = ll.LatLng(pos.latitude, pos.longitude);
-    final start = widget.locateMode ? cur : widget.start;
-    final xt = widget.locateMode
-        ? 0.0
-        : PathGuidance.crossTrackM(cur, widget.start, widget.end);
-    final dist = PathGuidance.distanceM(cur, widget.end);
-    final bearing = PathGuidance.bearingDeg(start, widget.end);
-    final overshoot = widget.locateMode
-        ? false
-        : PathGuidance.isPastEnd(cur, widget.start, widget.end);
     final arrivalR = PathGuidance.arrivalRadiusM(pos.accuracy);
-    final arrived = dist <= arrivalR;
-    final onPath = !overshoot &&
-        (widget.locateMode
-            ? PathGuidance.signedTurnDeg(
-                      _headingMag,
-                      PathGuidance.trueToMagnetic(bearing),
-                    ).abs() <=
-                20
-            : xt.abs() <= 1.5);
 
-    // Haptics on transitions
-    if (_wasOnPath != null && _wasOnPath != onPath && !arrived) {
+    double xt;
+    double distRemain;
+    double alongPath;
+    double total;
+    double bearing;
+    bool overshoot;
+    bool arrived;
+    String segLabel;
+
+    if (widget.locateMode) {
+      xt = 0.0;
+      distRemain = PathGuidance.distanceM(cur, widget.end);
+      alongPath = 0;
+      total = distRemain;
+      bearing = PathGuidance.bearingDeg(cur, widget.end);
+      overshoot = false;
+      arrived = distRemain <= arrivalR;
+      segLabel = '→ ${widget.endLabel}';
+    } else {
+      final fix = _path.evaluate(cur);
+      xt = fix.crossTrackM;
+      distRemain = fix.remainingM;
+      alongPath = fix.alongPathM;
+      total = fix.totalLengthM;
+      bearing = fix.desiredBearingDeg;
+      overshoot = fix.pastEnd;
+      arrived = PathGuidance.distanceM(cur, widget.end) <= arrivalR ||
+          (fix.remainingM <= arrivalR &&
+              fix.segmentIndex == _path.segmentCount - 1);
+      segLabel = fix.segmentLabel;
+    }
+
+    final onLine = widget.locateMode
+        ? PathGuidance.signedTurnDeg(
+                  _headingMag,
+                  PathGuidance.trueToMagnetic(bearing),
+                ).abs() <=
+            20
+        : !overshoot && xt.abs() <= _tol;
+
+    if (_wasOnLine != null && _wasOnLine != onLine && !arrived) {
       HapticFeedback.lightImpact();
     }
     if (!_arrived && arrived) {
       HapticFeedback.mediumImpact();
     }
-    _wasOnPath = onPath;
+    _wasOnLine = onLine;
 
     if (!mounted) return;
     setState(() {
@@ -146,11 +208,14 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
       _gpsFix = true;
       _accuracyM = pos.accuracy;
       _xt = xt;
-      _distRemain = dist;
+      _distRemain = distRemain;
+      _alongPath = alongPath;
+      _totalPath = total;
       _targetBearingTrue = bearing;
       _overshoot = overshoot;
       _arrived = arrived;
-      _applyAutoMode();
+      _segmentLabel = segLabel;
+      if (widget.locateMode) _applyAutoMode();
     });
   }
 
@@ -189,47 +254,110 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     super.dispose();
   }
 
+  List<MapMarkerData> get _markers {
+    final out = <MapMarkerData>[];
+    if (widget.locateMode) {
+      out.add(MapMarkerData(
+        point: widget.end,
+        label: widget.endLabel,
+        color: PathfinderTheme.accent,
+      ));
+      return out;
+    }
+    final verts = _path.vertices;
+    for (var i = 0; i < verts.length; i++) {
+      final v = verts[i];
+      final isStart = i == 0;
+      final isEnd = i == verts.length - 1;
+      out.add(MapMarkerData(
+        point: v.point,
+        label: _path.defaultVertexLabel(i),
+        color: isStart
+            ? Colors.green
+            : isEnd
+                ? PathfinderTheme.accent
+                : Colors.orange,
+      ));
+    }
+    return out;
+  }
+
+  List<ll.LatLng> get _polyline {
+    if (widget.locateMode) {
+      return _cur != null ? [_cur!, widget.end] : [widget.start, widget.end];
+    }
+    return _path.points;
+  }
+
+  /// Short perpendicular tick from user toward the line (visual XT cue).
+  List<ll.LatLng>? get _offsetIndicator {
+    if (widget.locateMode || _cur == null || !_gpsFix) return null;
+    if (_xt.abs() < 0.3) return null;
+    // Approximate: move from current toward line by XT along perpendicular.
+    // Project onto path; draw cur → foot of perpendicular (approx via along).
+    final fix = _path.evaluate(_cur!);
+    final a = _path.vertices[fix.segmentIndex].point;
+    final b = _path.vertices[fix.segmentIndex + 1].point;
+    final frac = (fix.alongSegmentM / max(fix.segmentLengthM, 0.01))
+        .clamp(0.0, 1.0);
+    final foot = ll.LatLng(
+      a.latitude + (b.latitude - a.latitude) * frac,
+      a.longitude + (b.longitude - a.longitude) * frac,
+    );
+    return [_cur!, foot];
+  }
+
   @override
   Widget build(BuildContext context) {
     final arrivalR = PathGuidance.arrivalRadiusM(_accuracyM);
-    final statusText = !_gpsFix
-        ? 'Acquiring GPS…'
-        : _arrived
-            ? 'ARRIVED (±${arrivalR.toStringAsFixed(0)} m)'
-            : _overshoot
-                ? 'PASSED TARGET — TURN BACK'
-                : PathGuidance.headingAwareMessage(
-                    headingMagDeg: _headingMag,
-                    desiredTrueBearingDeg: _targetBearingTrue,
-                    xtM: widget.locateMode ? null : _xt,
-                  );
+    final tol = _tol;
 
-    final onPath = statusText == 'ON PATH';
+    final String statusText;
+    if (!_gpsFix) {
+      statusText = 'Acquiring GPS…';
+    } else if (_arrived) {
+      statusText = 'ARRIVED (±${arrivalR.toStringAsFixed(0)} m)';
+    } else if (_overshoot) {
+      statusText = 'PASSED END — TURN BACK';
+    } else if (widget.locateMode) {
+      statusText = PathGuidance.headingAwareMessage(
+        headingMagDeg: _headingMag,
+        desiredTrueBearingDeg: _targetBearingTrue,
+        xtM: null,
+      );
+    } else {
+      // Stay-on-line first: XT hero, not compass-to-end.
+      statusText =
+          PathGuidance.stayOnLineMessage(_xt, onTrackTolM: tol);
+    }
+
+    final onLine = statusText == 'ON LINE' || statusText == 'ON PATH';
     final statusColor = !_gpsFix
         ? Colors.grey
         : _arrived
             ? Colors.green
             : _overshoot
                 ? Colors.orange
-                : onPath
+                : onLine
                     ? Colors.green
                     : Colors.red;
 
-    final line = widget.locateMode
-        ? (_cur != null ? [_cur!, widget.end] : [widget.start, widget.end])
-        : [widget.start, widget.end];
-
     final magTarget = PathGuidance.trueToMagnetic(_targetBearingTrue);
     final needsCalib =
-        _compassAccuracy != null && _compassAccuracy! < 0; // platform-dependent
+        _compassAccuracy != null && _compassAccuracy! < 0;
     final farAway = DistanceFormat.preferRoadDirections(_distRemain);
     final distLabel = DistanceFormat.format(_distRemain);
+    final title = widget.locateMode
+        ? 'Locate ${widget.endLabel}'
+        : (_path.segmentCount > 1
+            ? 'Walk the line (${_path.vertices.length} pts)'
+            : '${widget.startLabel} → ${widget.endLabel}');
+
+    final offsetLine = _offsetIndicator;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.locateMode
-            ? 'Locate ${widget.endLabel}'
-            : '${widget.startLabel} → ${widget.endLabel}'),
+        title: Text(title),
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 8),
@@ -238,8 +366,8 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 decoration: BoxDecoration(
-                  color:
-                      GpsService.accuracyColor(_accuracyM).withValues(alpha: 0.2),
+                  color: GpsService.accuracyColor(_accuracyM)
+                      .withValues(alpha: 0.2),
                   borderRadius: BorderRadius.circular(12),
                   border:
                       Border.all(color: GpsService.accuracyColor(_accuracyM)),
@@ -264,23 +392,13 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
             child: HybridMap(
               center: _cur ?? widget.end,
               initialZoom: 16,
-              polyline: line,
+              polyline: _polyline,
               userLocation: _cur,
               fitToFeatures: true,
               showDownloadButton: false,
-              markers: [
-                if (!widget.locateMode)
-                  MapMarkerData(
-                    point: widget.start,
-                    label: widget.startLabel,
-                    color: Colors.green,
-                  ),
-                MapMarkerData(
-                  point: widget.end,
-                  label: widget.endLabel,
-                  color: PathfinderTheme.accent,
-                ),
-              ],
+              markers: _markers,
+              // Second polyline via markers only — HybridMap may take one poly;
+              // offset shown in metrics if map has single polyline.
             ),
           ),
           Expanded(
@@ -296,33 +414,55 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                           child: Text(_error!, textAlign: TextAlign.center))
                       : Column(
                           children: [
-                            SegmentedButton<_LocateUiMode>(
-                              segments: const [
-                                ButtonSegment(
-                                  value: _LocateUiMode.directions,
-                                  label: Text('Directions'),
-                                  icon: Icon(Icons.directions_car, size: 18),
-                                ),
-                                ButtonSegment(
-                                  value: _LocateUiMode.straightLine,
-                                  label: Text('Straight line'),
-                                  icon: Icon(Icons.explore, size: 18),
-                                ),
-                              ],
-                              selected: {_mode},
-                              onSelectionChanged: (s) => _setMode(s.first),
-                            ),
+                            if (widget.locateMode || farAway)
+                              SegmentedButton<_LocateUiMode>(
+                                segments: const [
+                                  ButtonSegment(
+                                    value: _LocateUiMode.directions,
+                                    label: Text('Directions'),
+                                    icon:
+                                        Icon(Icons.directions_car, size: 18),
+                                  ),
+                                  ButtonSegment(
+                                    value: _LocateUiMode.stayOnLine,
+                                    label: Text('On line'),
+                                    icon: Icon(Icons.straighten, size: 18),
+                                  ),
+                                ],
+                                selected: {_mode},
+                                onSelectionChanged: (s) => _setMode(s.first),
+                              )
+                            else
+                              SegmentedButton<_LocateUiMode>(
+                                segments: const [
+                                  ButtonSegment(
+                                    value: _LocateUiMode.stayOnLine,
+                                    label: Text('Stay on line'),
+                                    icon: Icon(Icons.straighten, size: 18),
+                                  ),
+                                  ButtonSegment(
+                                    value: _LocateUiMode.directions,
+                                    label: Text('Directions'),
+                                    icon:
+                                        Icon(Icons.directions_car, size: 18),
+                                  ),
+                                ],
+                                selected: {_mode},
+                                onSelectionChanged: (s) => _setMode(s.first),
+                              ),
                             const SizedBox(height: 8),
                             Expanded(
                               child: _mode == _LocateUiMode.directions
                                   ? _directionsPane(distLabel, farAway)
-                                  : _straightLinePane(
+                                  : _stayOnLinePane(
                                       statusText,
                                       statusColor,
                                       distLabel,
                                       magTarget,
                                       needsCalib,
                                       farAway,
+                                      tol,
+                                      offsetLine,
                                     ),
                             ),
                           ],
@@ -351,7 +491,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
           Text(
             widget.locateMode
                 ? 'straight-line to ${widget.endLabel}'
-                : 'straight-line to endpoint',
+                : 'remaining along path',
             style: TextStyle(
               fontSize: 16,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -367,7 +507,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
-                      "You're $distLabel away - get road directions first",
+                      "You're $distLabel away — get road directions first",
                       textAlign: TextAlign.center,
                       style: const TextStyle(
                         fontSize: 16,
@@ -376,12 +516,12 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      'Drive as close as you can, then switch to Straight line '
-                      'for bush cutline + compass.',
+                      'Drive close, then switch to Stay on line for pipe/fence laying.',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         fontSize: 13,
-                        color: Theme.of(context).colorScheme.onPrimaryContainer,
+                        color:
+                            Theme.of(context).colorScheme.onPrimaryContainer,
                       ),
                     ),
                     const SizedBox(height: 12),
@@ -393,8 +533,8 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                     const SizedBox(height: 8),
                     TextButton(
                       onPressed: () =>
-                          _setMode(_LocateUiMode.straightLine),
-                      child: const Text('Use straight-line guidance anyway'),
+                          _setMode(_LocateUiMode.stayOnLine),
+                      child: const Text('Use stay-on-line guidance anyway'),
                     ),
                   ],
                 ),
@@ -411,38 +551,33 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
             ),
             const SizedBox(height: 8),
             OutlinedButton(
-              onPressed: () => _setMode(_LocateUiMode.straightLine),
-              child: const Text('Switch to straight-line guidance'),
+              onPressed: () => _setMode(_LocateUiMode.stayOnLine),
+              child: const Text('Switch to stay-on-line'),
             ),
           ],
-          const SizedBox(height: 12),
-          Text(
-            'Opens turn-by-turn navigation to the target coordinates. '
-            'Does not replace in-app bush guidance.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 12,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
         ],
       ),
     );
   }
 
-  Widget _straightLinePane(
+  Widget _stayOnLinePane(
     String statusText,
     Color statusColor,
     String distLabel,
     double magTarget,
     bool needsCalib,
     bool farAway,
+    double tol,
+    List<ll.LatLng>? offsetLine,
   ) {
+    final progressFrac =
+        _totalPath <= 0 ? 0.0 : (_alongPath / _totalPath).clamp(0.0, 1.0);
+
     return SingleChildScrollView(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          if (farAway) ...[
+          if (farAway && widget.locateMode) ...[
             Card(
               color: Colors.orange.shade50,
               child: Padding(
@@ -451,7 +586,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
-                      "You're $distLabel away - get road directions first",
+                      "You're $distLabel away — get road directions first",
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         fontSize: 14,
@@ -468,60 +603,132 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                         backgroundColor: Colors.orange.shade800,
                       ),
                     ),
-                    TextButton(
-                      onPressed: () => _setMode(_LocateUiMode.directions),
-                      child: const Text('Switch to Directions mode'),
-                    ),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 8),
           ],
-          Text(
-            statusText,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 22,
-              fontWeight: FontWeight.w800,
-              color: _darken(statusColor),
-              letterSpacing: 0.5,
+          // —— Hero status ——
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+            decoration: BoxDecoration(
+              color: statusColor.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: statusColor, width: 2),
+            ),
+            child: Text(
+              statusText,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 32,
+                fontWeight: FontWeight.w900,
+                color: _darken(statusColor),
+                letterSpacing: 0.8,
+              ),
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            distLabel,
-            style: const TextStyle(
-              fontSize: 44,
-              fontWeight: FontWeight.bold,
-              fontFeatures: [FontFeature.tabularFigures()],
+          const SizedBox(height: 10),
+          if (!widget.locateMode) ...[
+            // Progress along path
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${DistanceFormat.format(_alongPath)} of '
+                    '${DistanceFormat.format(_totalPath)}',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                Text(
+                  '$distLabel left',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
-          ),
-          Text(
-            widget.locateMode
-                ? 'to ${widget.endLabel}'
-                : 'to endpoint',
-            style: TextStyle(
-              fontSize: 16,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: LinearProgressIndicator(
+                value: progressFrac,
+                minHeight: 10,
+                backgroundColor: Colors.grey.shade300,
+                color: onLineColor(statusColor),
+              ),
             ),
-          ),
+            if (_path.segmentCount > 1) ...[
+              const SizedBox(height: 6),
+              Text(
+                _segmentLabel,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+              ),
+            ],
+          ] else ...[
+            Text(
+              distLabel,
+              style: const TextStyle(
+                fontSize: 44,
+                fontWeight: FontWeight.bold,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+            Text(
+              'to ${widget.endLabel}',
+              style: TextStyle(
+                fontSize: 16,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
+          // Corridor control
+          if (!widget.locateMode)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton(
+                  tooltip: 'Narrower corridor',
+                  onPressed: () => setState(
+                      () => _baseTolM = (_baseTolM - 0.5).clamp(0.5, 8.0)),
+                  icon: const Icon(Icons.remove_circle_outline),
+                ),
+                Text(
+                  'Corridor ±${tol.toStringAsFixed(1)} m',
+                  style: const TextStyle(fontSize: 13),
+                ),
+                IconButton(
+                  tooltip: 'Wider corridor',
+                  onPressed: () => setState(
+                      () => _baseTolM = (_baseTolM + 0.5).clamp(0.5, 8.0)),
+                  icon: const Icon(Icons.add_circle_outline),
+                ),
+              ],
+            ),
+          const SizedBox(height: 4),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              _metric('Bearing (true)',
-                  '${_targetBearingTrue.toStringAsFixed(0)}°'),
-              _metric('Mag target', '${magTarget.toStringAsFixed(0)}°'),
-              _metric('Heading (mag)', '${_headingMag.toStringAsFixed(0)}°'),
+              _metric('Bearing', '${_targetBearingTrue.toStringAsFixed(0)}°'),
+              _metric('Heading', '${_headingMag.toStringAsFixed(0)}°'),
               if (!widget.locateMode)
-                _metric('XT', '${_xt.abs().toStringAsFixed(1)} m'),
+                _metric('Offset', '${_xt.abs().toStringAsFixed(1)} m'),
             ],
           ),
           const SizedBox(height: 4),
           Text(
-            'Compass is magnetic · path bearing is true '
-            '(Botswana declination ≈ 13° W)',
+            'Stay on the line for pipes / fence. Compass is secondary '
+            '(magnetic · Botswana ≈ 13° W).',
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 11,
@@ -533,7 +740,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                'Compass accuracy looks poor — wave the phone in a figure-8 to calibrate.',
+                'Compass accuracy looks poor — wave the phone in a figure-8.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: Colors.orange.shade800),
               ),
@@ -545,18 +752,19 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
               padding: EdgeInsets.all(24),
               child: CircularProgressIndicator(),
             ),
-          if (!farAway) ...[
-            const SizedBox(height: 8),
-            TextButton.icon(
-              onPressed: _openMaps,
-              icon: const Icon(Icons.map, size: 18),
-              label: const Text('Open in Google Maps'),
-            ),
-          ],
+          const SizedBox(height: 4),
+          TextButton.icon(
+            onPressed: _openMaps,
+            icon: const Icon(Icons.map, size: 18),
+            label: const Text('Open in Google Maps'),
+          ),
         ],
       ),
     );
   }
+
+  Color onLineColor(Color statusColor) =>
+      statusColor == Colors.green ? Colors.green : PathfinderTheme.sky;
 
   Widget _permDenied() => Padding(
         padding: const EdgeInsets.all(24),
@@ -591,34 +799,36 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     final headingDiff = (_headingMag - magTarget + 360) % 360;
     final aligned = headingDiff < 8 || headingDiff > 352;
     return SizedBox(
-      width: 140,
-      height: 140,
+      width: 110,
+      height: 110,
       child: Stack(
         alignment: Alignment.center,
         children: [
           Transform.rotate(
             angle: -_headingMag * pi / 180,
             child: Container(
-              width: 130,
-              height: 130,
+              width: 100,
+              height: 100,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 border: Border.all(
                   color: aligned ? Colors.green : Colors.grey.shade400,
-                  width: 3,
+                  width: 2,
                 ),
               ),
               child: const Stack(
                 alignment: Alignment.center,
                 children: [
                   Positioned(
-                      top: 4,
+                      top: 2,
                       child: Text('N',
                           style: TextStyle(
-                              fontWeight: FontWeight.bold, color: Colors.red))),
-                  Positioned(bottom: 4, child: Text('S')),
-                  Positioned(left: 8, child: Text('W')),
-                  Positioned(right: 8, child: Text('E')),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                              color: Colors.red))),
+                  Positioned(bottom: 2, child: Text('S', style: TextStyle(fontSize: 11))),
+                  Positioned(left: 6, child: Text('W', style: TextStyle(fontSize: 11))),
+                  Positioned(right: 6, child: Text('E', style: TextStyle(fontSize: 11))),
                 ],
               ),
             ),
@@ -626,7 +836,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
           Transform.rotate(
             angle: (magTarget - _headingMag) * pi / 180,
             child: Icon(Icons.navigation,
-                size: 48,
+                size: 36,
                 color: aligned ? Colors.green : PathfinderTheme.sky),
           ),
         ],

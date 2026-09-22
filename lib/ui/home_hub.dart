@@ -35,7 +35,7 @@ class HomeHub extends StatelessWidget {
                     const Expanded(
                       child: BrandHeader(
                         subtitle:
-                            'Find your plot · walk a line · calculate area',
+                            'Find your plot · walk a pipe/fence line · calculate area',
                         logoSize: 68,
                       ),
                     ),
@@ -89,8 +89,8 @@ class HomeHub extends StatelessWidget {
                   tint: PfColors.sandGoldDeep,
                   title: 'Walk a line',
                   subtitle:
-                      'Pick two points (or find one corner from where you stand). '
-                      'Live left/right guidance across open bush.',
+                      'Lay pipe, fence, or utilities on a straight or bent line. '
+                      'Live ON LINE / LEFT / RIGHT offset while you walk.',
                   cta: 'Open Walk a line',
                   onTap: () => Navigator.push(
                     context,

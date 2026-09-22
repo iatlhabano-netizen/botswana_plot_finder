@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import '../../core/models.dart';
 import '../../services/waypoint_store.dart';
 
-enum WaypointPickAction { useAsStart, useAsEnd, none }
+enum WaypointPickAction { useAsStart, useAsEnd, useAsVia, none }
 
 /// Bottom sheet: list / rename / delete / copy / pick saved waypoints.
 class SavedWaypointsSheet extends StatefulWidget {
@@ -202,6 +202,10 @@ class _SavedWaypointsSheetState extends State<SavedWaypointsSheet> {
               widget.onPick?.call(wp, WaypointPickAction.useAsEnd);
               if (mounted) Navigator.pop(context);
               break;
+            case 'via':
+              widget.onPick?.call(wp, WaypointPickAction.useAsVia);
+              if (mounted) Navigator.pop(context);
+              break;
             case 'copy':
               await _copy(wp);
               break;
@@ -221,6 +225,7 @@ class _SavedWaypointsSheetState extends State<SavedWaypointsSheet> {
             const PopupMenuItem(
                 value: 'start', child: Text('Use as start')),
             const PopupMenuItem(value: 'end', child: Text('Use as end')),
+            const PopupMenuItem(value: 'via', child: Text('Use as via / bend')),
             const PopupMenuDivider(),
           ],
           const PopupMenuItem(value: 'copy', child: Text('Copy WGS84')),

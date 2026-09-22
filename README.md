@@ -42,11 +42,13 @@ flutter build apk --release --split-per-abi
 
 Botswana, South Africa, Namibia, Zimbabwe, Eswatini, Lesotho — Cape / Hartebeesthoek94 / Schwarzeck / Arc 1950 / BTRS02 as applicable.
 
-## Walk a line / Pathfinder (v4.4+)
-- Interactive map: **Set start** / **Set end** / **Pan** — tap to place endpoints.
-- **My location**, **Copy my GPS**, save GPS/start/end as labeled waypoints.
-- **Saved points** sheet: rename, delete, copy WGS84 (and Lo if stored), use as start/end.
-- Manual WGS84 / Lo entry and guidance (Directions vs Straight line) unchanged.
+## Walk a line / Pathfinder (v4.5+)
+- **Stay-on-line first** for laying water pipe, fence, or utilities — not primarily compass-to-end.
+- Map: **Start** / **Add bend** / **End** / **Pan**. Multi-point paths (A → via → B).
+- Prominent path length; primary CTA **Walk the line**.
+- Guidance hero: huge **ON LINE** / **LEFT x.x m** / **RIGHT x.x m**, plus along-path progress and remaining distance.
+- Corridor widens with GPS accuracy; optional ± corridor control.
+- Typed WGS84 / Lo under **Advanced**. Saved points can be start / end / via.
 
 ## Offline maps (v4.3+)
 - Basemap tiles use **CartoCDN Voyager** (OSM data) with disk cache (~60 days).
