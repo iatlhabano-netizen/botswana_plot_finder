@@ -144,14 +144,23 @@ class PathGuidance {
   }
 
   /// Widen corridor with GPS accuracy so poor fixes don't false-alarm.
-  /// Default base ~1.8 m; floor expands with ~0.7 × accuracy.
+  /// Default base ~1.8 m; expands with k×accuracy; clamped 0.5–12 m.
   static double corridorToleranceM({
     double baseTolM = 1.8,
     double? accuracyM,
-    double accuracyFactor = 0.7,
+    double accuracyFactor = 0.6,
   }) {
     final acc = accuracyM ?? 0.0;
-    return max(baseTolM, accuracyFactor * acc);
+    return max(baseTolM, accuracyFactor * acc).clamp(0.5, 12.0);
+  }
+
+  /// Action subtitle for stay-on-line hero (how to correct).
+  static String stayOnLineAction(double xtM, {double onTrackTolM = 1.5}) {
+    if (xtM.abs() <= onTrackTolM) {
+      return 'inside ±${onTrackTolM.toStringAsFixed(1)} m corridor';
+    }
+    if (xtM > 0) return 'move left back onto the line';
+    return 'move right back onto the line';
   }
 }
 

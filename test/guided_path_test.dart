@@ -63,7 +63,7 @@ void main() {
     );
     expect(
       PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 10.0),
-      closeTo(7.0, 0.01),
+      closeTo(6.0, 0.01),
     );
   });
 

@@ -22,6 +22,25 @@ class MapMarkerData {
   });
 }
 
+
+/// Imperative camera helpers for guidance recenter FAB.
+class HybridMapController {
+  void Function(ll.LatLng target, {double? zoom})? _move;
+  void Function()? _fit;
+
+  void _attach({
+    required void Function(ll.LatLng target, {double? zoom}) move,
+    required void Function() fit,
+  }) {
+    _move = move;
+    _fit = fit;
+  }
+
+  void moveTo(ll.LatLng target, {double? zoom}) => _move?.call(target, zoom: zoom);
+
+  void fitFeatures() => _fit?.call();
+}
+
 class HybridMap extends StatefulWidget {
   final ll.LatLng center;
   final double initialZoom;
@@ -33,6 +52,17 @@ class HybridMap extends StatefulWidget {
   final bool showOfflineBanner;
   final bool fitToFeatures;
   final bool showDownloadButton;
+  /// GPS accuracy circle radius around [userLocation] (metres).
+  final double? accuracyM;
+  /// Optional second polyline (e.g. user → foot of perpendicular).
+  final List<ll.LatLng> secondaryPolyline;
+  /// Corridor / overlay polygon colours (default plot green).
+  final Color polygonStroke;
+  final Color polygonFill;
+  /// When false, centre/user updates never re-fit the camera (guidance mode).
+  final bool refitOnUpdate;
+  /// Optional controller for recenter FAB.
+  final HybridMapController? controller;
 
   const HybridMap({
     super.key,
@@ -46,6 +76,12 @@ class HybridMap extends StatefulWidget {
     this.showOfflineBanner = true,
     this.fitToFeatures = true,
     this.showDownloadButton = true,
+    this.accuracyM,
+    this.secondaryPolyline = const [],
+    this.polygonStroke = const Color(0xFF0B6E4F),
+    this.polygonFill = const Color(0xFF0B6E4F),
+    this.refitOnUpdate = true,
+    this.controller,
   });
 
   @override
@@ -76,7 +112,55 @@ class _HybridMapState extends State<HybridMap> {
   @override
   void initState() {
     super.initState();
+    widget.controller?._attach(move: _moveTo, fit: _forceFit);
     _loadPref();
+  }
+
+  @override
+  void didUpdateWidget(covariant HybridMap oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.controller != oldWidget.controller) {
+      widget.controller?._attach(move: _moveTo, fit: _forceFit);
+    }
+    final markersChanged = oldWidget.markers.length != widget.markers.length ||
+        !_samePoints(
+          oldWidget.markers.map((m) => m.point).toList(),
+          widget.markers.map((m) => m.point).toList(),
+        );
+    final pathChanged = oldWidget.polygon != widget.polygon ||
+        oldWidget.polyline != widget.polyline ||
+        markersChanged;
+    // Only re-fit when path features change — never on every GPS centre tick.
+    if (widget.refitOnUpdate && pathChanged) {
+      _fitted = false;
+      if (!_useGoogle) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _fitOsm());
+      } else {
+        _fitGoogle();
+      }
+    }
+  }
+
+  void _forceFit() {
+    _fitted = false;
+    if (!_useGoogle) {
+      _fitOsm();
+    } else {
+      _fitGoogle();
+    }
+  }
+
+  void _moveTo(ll.LatLng target, {double? zoom}) {
+    if (_useGoogle) {
+      _gCtrl?.animateCamera(
+        gmaps.CameraUpdate.newLatLngZoom(
+          gmaps.LatLng(target.latitude, target.longitude),
+          zoom ?? widget.initialZoom,
+        ),
+      );
+    } else {
+      _osmCtrl.move(target, zoom ?? _osmCtrl.camera.zoom);
+    }
   }
 
   Future<void> _loadPref() async {
@@ -153,26 +237,6 @@ class _HybridMapState extends State<HybridMap> {
     } catch (_) {}
   }
 
-  @override
-  void didUpdateWidget(covariant HybridMap oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    final markersChanged = oldWidget.markers.length != widget.markers.length ||
-        !_samePoints(
-          oldWidget.markers.map((m) => m.point).toList(),
-          widget.markers.map((m) => m.point).toList(),
-        );
-    if (oldWidget.center != widget.center ||
-        oldWidget.polygon != widget.polygon ||
-        oldWidget.polyline != widget.polyline ||
-        markersChanged) {
-      _fitted = false;
-      if (!_useGoogle) {
-        WidgetsBinding.instance.addPostFrameCallback((_) => _fitOsm());
-      } else {
-        _fitGoogle();
-      }
-    }
-  }
 
   bool _samePoints(List<ll.LatLng> a, List<ll.LatLng> b) {
     if (a.length != b.length) return false;
@@ -295,25 +359,52 @@ class _HybridMapState extends State<HybridMap> {
               points: widget.polygon
                   .map((p) => gmaps.LatLng(p.latitude, p.longitude))
                   .toList(),
-              strokeWidth: 3,
-              strokeColor: const Color(0xFF0B6E4F),
-              fillColor: const Color(0xFF0B6E4F).withValues(alpha: 0.2),
+              strokeWidth: 2,
+              strokeColor: widget.polygonStroke,
+              fillColor: widget.polygonFill.withValues(alpha: 0.18),
             )
           }
         : <gmaps.Polygon>{};
 
-    final line = widget.polyline.length >= 2
-        ? {
-            gmaps.Polyline(
-              polylineId: const gmaps.PolylineId('path'),
-              points: widget.polyline
-                  .map((p) => gmaps.LatLng(p.latitude, p.longitude))
-                  .toList(),
-              width: 5,
-              color: const Color(0xFFE85D04),
-            )
-          }
-        : <gmaps.Polyline>{};
+    final line = <gmaps.Polyline>{};
+    if (widget.polyline.length >= 2) {
+      line.add(gmaps.Polyline(
+        polylineId: const gmaps.PolylineId('path'),
+        points: widget.polyline
+            .map((p) => gmaps.LatLng(p.latitude, p.longitude))
+            .toList(),
+        width: 5,
+        color: const Color(0xFFE85D04),
+      ));
+    }
+    if (widget.secondaryPolyline.length >= 2) {
+      line.add(gmaps.Polyline(
+        polylineId: const gmaps.PolylineId('xt'),
+        points: widget.secondaryPolyline
+            .map((p) => gmaps.LatLng(p.latitude, p.longitude))
+            .toList(),
+        width: 3,
+        color: const Color(0xFF58B6E8),
+        patterns: [gmaps.PatternItem.dash(12), gmaps.PatternItem.gap(8)],
+      ));
+    }
+
+    final circles = <gmaps.Circle>{};
+    if (widget.userLocation != null &&
+        widget.accuracyM != null &&
+        widget.accuracyM! > 0) {
+      circles.add(gmaps.Circle(
+        circleId: const gmaps.CircleId('acc'),
+        center: gmaps.LatLng(
+          widget.userLocation!.latitude,
+          widget.userLocation!.longitude,
+        ),
+        radius: widget.accuracyM!,
+        strokeWidth: 1,
+        strokeColor: const Color(0xFF58B6E8).withValues(alpha: 0.6),
+        fillColor: const Color(0xFF58B6E8).withValues(alpha: 0.1),
+      ));
+    }
 
     final markers = <gmaps.Marker>{};
     for (var i = 0; i < widget.markers.length; i++) {
@@ -353,9 +444,10 @@ class _HybridMapState extends State<HybridMap> {
       ),
       polygons: poly,
       polylines: line,
+      circles: circles,
       markers: markers,
       myLocationEnabled: true,
-      myLocationButtonEnabled: true,
+      myLocationButtonEnabled: false,
       mapType: gmaps.MapType.hybrid,
       onMapCreated: (c) {
         _gCtrl = c;
@@ -388,17 +480,38 @@ class _HybridMapState extends State<HybridMap> {
           PolygonLayer(polygons: [
             Polygon(
               points: widget.polygon,
-              color: const Color(0xFF0B6E4F).withValues(alpha: 0.2),
-              borderColor: const Color(0xFF0B6E4F),
-              borderStrokeWidth: 3,
+              color: widget.polygonFill.withValues(alpha: 0.18),
+              borderColor: widget.polygonStroke,
+              borderStrokeWidth: 2,
             ),
           ]),
-        if (widget.polyline.length >= 2)
+        if (widget.polyline.length >= 2 || widget.secondaryPolyline.length >= 2)
           PolylineLayer(polylines: [
-            Polyline(
-              points: widget.polyline,
-              color: const Color(0xFFE85D04),
-              strokeWidth: 5,
+            if (widget.polyline.length >= 2)
+              Polyline(
+                points: widget.polyline,
+                color: const Color(0xFFE85D04),
+                strokeWidth: 5,
+              ),
+            if (widget.secondaryPolyline.length >= 2)
+              Polyline(
+                points: widget.secondaryPolyline,
+                color: const Color(0xFF58B6E8),
+                strokeWidth: 3,
+                strokeCap: StrokeCap.round,
+              ),
+          ]),
+        if (widget.userLocation != null &&
+            widget.accuracyM != null &&
+            widget.accuracyM! > 0)
+          CircleLayer(circles: [
+            CircleMarker(
+              point: widget.userLocation!,
+              radius: widget.accuracyM!,
+              useRadiusInMeter: true,
+              color: const Color(0xFF58B6E8).withValues(alpha: 0.12),
+              borderColor: const Color(0xFF58B6E8).withValues(alpha: 0.55),
+              borderStrokeWidth: 1,
             ),
           ]),
         MarkerLayer(

@@ -95,6 +95,6 @@ void main() {
 
   test('corridorToleranceM expands with accuracy', () {
     expect(PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 1), closeTo(1.8, 0.01));
-    expect(PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 5), closeTo(3.5, 0.01));
+    expect(PathGuidance.corridorToleranceM(baseTolM: 1.8, accuracyM: 5), closeTo(3.0, 0.01));
   });
 }

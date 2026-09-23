@@ -2,6 +2,8 @@ import 'dart:math';
 
 import 'package:latlong2/latlong.dart' as ll;
 
+import 'line_geo.dart';
+import 'line_projector.dart';
 import 'path_guidance.dart';
 
 /// One vertex on a guided pipe/fence path (start, via, or end).
@@ -66,6 +68,9 @@ class GuidedPath {
   List<ll.LatLng> get points =>
       vertices.map((v) => v.point).toList(growable: false);
 
+  List<String?> get labels =>
+      vertices.map((v) => v.label).toList(growable: false);
+
   /// Length of segment [i] (vertex i → i+1).
   double segmentLengthM(int i) {
     assert(i >= 0 && i < segmentCount);
@@ -88,6 +93,16 @@ class GuidedPath {
       sum += segmentLengthM(j);
     }
     return sum;
+  }
+
+  /// Cumulative distances at each vertex; cum[0] = 0.
+  List<double> get cumulativeM {
+    final cum = <double>[0];
+    for (var i = 1; i < vertices.length; i++) {
+      cum.add(cum[i - 1] +
+          PathGuidance.distanceM(vertices[i - 1].point, vertices[i].point));
+    }
+    return cum;
   }
 
   String defaultVertexLabel(int i) {
@@ -114,79 +129,32 @@ class GuidedPath {
     return GuidedPath(list);
   }
 
-  /// Project [cur] onto the path: best segment by min distance-to-segment,
-  /// preferring interior projections (|cross-track| when along-track in range).
+  /// Project [cur] onto the path (stateless one-shot, switchCost=2.5).
+  /// Prefer [LineProjector] in live guidance for dwell hysteresis.
   PathFix evaluate(ll.LatLng cur, {double endpointMarginM = 20.0}) {
     assert(isValid);
-    var bestScore = double.infinity;
-    var bestSeg = 0;
-    var bestXt = 0.0;
-    var bestAlong = 0.0;
-    var bestSegLen = segmentLengthM(0);
-
-    for (var i = 0; i < segmentCount; i++) {
-      final a = vertices[i].point;
-      final b = vertices[i + 1].point;
-      final segLen = PathGuidance.distanceM(a, b);
-      if (segLen < 0.01) continue;
-
-      final along = PathGuidance.alongTrackM(cur, a, b);
-      final xt = PathGuidance.crossTrackM(cur, a, b);
-
-      // Distance from point to finite segment (geodesic approximation).
-      final double score;
-      if (along >= -endpointMarginM && along <= segLen + endpointMarginM) {
-        // Prefer in-range / near-range by |XT|, with small penalty outside.
-        final outside = along < 0
-            ? -along
-            : (along > segLen ? along - segLen : 0.0);
-        score = xt.abs() + outside * 0.5;
-      } else if (along < 0) {
-        score = PathGuidance.distanceM(cur, a);
-      } else {
-        score = PathGuidance.distanceM(cur, b);
-      }
-
-      if (score < bestScore) {
-        bestScore = score;
-        bestSeg = i;
-        bestXt = xt;
-        bestAlong = along;
-        bestSegLen = segLen;
-      }
-    }
-
-    final clampedAlong = bestAlong.clamp(0.0, bestSegLen);
-    final progress = lengthBeforeSegment(bestSeg) + clampedAlong;
-    final total = totalLengthM;
-    final remaining = max(0.0, total - progress);
-
-    final pastEnd = bestSeg == segmentCount - 1 && bestAlong > bestSegLen - 0.5;
-
-    final a = vertices[bestSeg].point;
-    final b = vertices[bestSeg + 1].point;
-    // Desired bearing: along active segment toward next vertex.
-    // If behind start of segment, still aim along segment; if past end of
-    // last segment, bearing back toward end.
-    final double bearing;
-    if (pastEnd) {
-      bearing = PathGuidance.bearingDeg(b, a); // turn back
-    } else {
-      bearing = PathGuidance.bearingDeg(a, b);
-    }
-
-    return PathFix(
-      segmentIndex: bestSeg,
-      crossTrackM: bestXt,
-      alongSegmentM: bestAlong,
-      segmentLengthM: bestSegLen,
-      alongPathM: progress,
-      remainingM: remaining,
-      totalLengthM: total,
-      pastEnd: pastEnd,
-      desiredBearingDeg: bearing,
-      segmentLabel: segmentLabel(bestSeg),
+    final proj = LineProjector.projectOnce(
+      cur,
+      points,
+      labels: labels,
+      hintLeg: 0,
     );
+    if (proj == null) {
+      return PathFix(
+        segmentIndex: 0,
+        crossTrackM: 0,
+        alongSegmentM: 0,
+        segmentLengthM: 0,
+        alongPathM: 0,
+        remainingM: 0,
+        totalLengthM: 0,
+        pastEnd: false,
+        desiredBearingDeg: 0,
+        segmentLabel: '',
+        projected: vertices.first.point,
+      );
+    }
+    return PathFix.fromProjection(proj);
   }
 }
 
@@ -202,6 +170,7 @@ class PathFix {
   final bool pastEnd;
   final double desiredBearingDeg;
   final String segmentLabel;
+  final ll.LatLng projected;
 
   const PathFix({
     required this.segmentIndex,
@@ -214,7 +183,22 @@ class PathFix {
     required this.pastEnd,
     required this.desiredBearingDeg,
     required this.segmentLabel,
+    required this.projected,
   });
+
+  factory PathFix.fromProjection(PathProjection p) => PathFix(
+        segmentIndex: p.legIndex,
+        crossTrackM: p.crossTrackM,
+        alongSegmentM: p.alongSegmentM,
+        segmentLengthM: p.segmentLengthM,
+        alongPathM: p.alongPathM,
+        remainingM: p.remainingM,
+        totalLengthM: p.totalM,
+        pastEnd: p.pastEnd,
+        desiredBearingDeg: p.segmentBearingDeg,
+        segmentLabel: p.segmentLabel,
+        projected: p.projected,
+      );
 
   double get progressFraction =>
       totalLengthM <= 0 ? 0.0 : (alongPathM / totalLengthM).clamp(0.0, 1.0);

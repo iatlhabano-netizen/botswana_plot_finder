@@ -42,6 +42,12 @@ flutter build apk --release --split-per-abi
 
 Botswana, South Africa, Namibia, Zimbabwe, Eswatini, Lesotho — Cape / Hartebeesthoek94 / Schwarzeck / Arc 1950 / BTRS02 as applicable.
 
+## Walk a line / Pathfinder (v4.6+)
+- **Stay-on-line rebuild**: geodesic/ENU cross-track (positive = RIGHT), multi-leg projector with switchCost (~2.5 m) + dwell (≥2 fixes), GPS ENU smoother, dual EMA, Schmitt ON LINE (enter ~0.85× / exit ~1.12× corridor).
+- Corridor = max(user base, k×accuracy), user ±, clamped ~0.5–12 m; map **corridor polygon** + foot-of-perpendicular + accuracy circle.
+- Guidance hero: **ON LINE / LEFT x.x m / RIGHT x.x m** + action subtitle, lateral **gauge**, progress with **bend ticks**, leg chip, stale-GPS banner, sunlight/high-contrast toggle, wakelock; compass optional/secondary.
+- Map-first setup: Start → Add bend → End, length, **Walk the line**.
+
 ## Walk a line / Pathfinder (v4.5+)
 - **Stay-on-line first** for laying water pipe, fence, or utilities — not primarily compass-to-end.
 - Map: **Start** / **Add bend** / **End** / **Pan**. Multi-point paths (A → via → B).
