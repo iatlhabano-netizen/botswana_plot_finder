@@ -118,8 +118,69 @@ class OcrService {
     );
   }
 
+  /// Botswana Lo plausible southing |X| (metres from equator, Capricorn belt).
+  static const double _minSouthingAbs = 1000000;
+  static const double _maxSouthingAbs = 9500000;
+
+  /// Botswana Lo plausible westing |Y| (metres from zone central meridian).
+  static const double _maxWestingAbs = 600000;
+
+  /// Reject tiny OCR junk (e.g. 123 / 456) while allowing real |Y| ~ tens of km.
+  static const double _minWestingAbs = 1000;
+
+  /// Collapse OCR artifacts in Lo numbers: spaced signs, spaced/comma thousands.
+  ///
+  /// Examples: `- 255 124.38` → `-255124.38`, `-7 604 978.00` → `-7604978.00`,
+  /// `255,124.38` → `255124.38`. Leaves decimal points alone; does not touch
+  /// bearings like `1.20.43` (multiple dots).
+  static String normalizeLoNumberText(String text) {
+    var s = text;
+    // Spaced sign before a digit: "- 255" / "+ 7" → "-255" / "+7"
+    s = s.replaceAllMapped(RegExp(r'([+-])\s+(?=\d)'), (m) => m.group(1)!);
+
+    // US/OCR thousands commas: 255,124.38 or 2,609,149
+    s = s.replaceAllMapped(
+      RegExp(r'(?<![\d.])\d{1,3}(?:,\d{3})+(?:\.\d+)?'),
+      (m) => m.group(0)!.replaceAll(',', ''),
+    );
+
+    // Spaced thousands groups: 255 124.38 / 7 604 978.00
+    s = s.replaceAllMapped(
+      RegExp(r'(?<![\d.])\d{1,3}(?:\s\d{3})+(?:\.\d+)?'),
+      (m) => m.group(0)!.replaceAll(RegExp(r'\s'), ''),
+    );
+
+    return s;
+  }
+
+  static bool _isPlausibleSouthing(double v) {
+    final a = v.abs();
+    return a >= _minSouthingAbs && a <= _maxSouthingAbs;
+  }
+
+  static bool _isPlausibleWesting(double v) {
+    final a = v.abs();
+    return a >= _minWestingAbs && a <= _maxWestingAbs;
+  }
+
+
+  static ParsedLoPair? _pairFromTwo(double a, double b) {
+    if (_isPlausibleWesting(a) && _isPlausibleSouthing(b)) {
+      return ParsedLoPair(westing: a, southing: b);
+    }
+    if (_isPlausibleSouthing(a) && _isPlausibleWesting(b)) {
+      return ParsedLoPair(westing: b, southing: a);
+    }
+    return null;
+  }
+
+  /// True for DMS-style bearings / directions e.g. `1.20.43` or `12.05.10`.
+  static final RegExp _bearingLike = RegExp(r'\d+\.\d+\.\d+');
+
   /// Extract Y/X (westing/southing) Lo pairs from cleaned OCR text.
   static List<ParsedLoPair> parseLoCoordinates(String cleaned) {
+    final text = normalizeLoNumberText(cleaned);
+
     final reYX = RegExp(
       r'Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)',
       caseSensitive: false,
@@ -132,7 +193,7 @@ class OcrService {
     final parsed = <ParsedLoPair>[];
     final spans = <(int, int)>[];
 
-    for (final m in reYX.allMatches(cleaned)) {
+    for (final m in reYX.allMatches(text)) {
       if (spans.any((sp) => m.start < sp.$2 && m.end > sp.$1)) continue;
       final w = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
       final s = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
@@ -141,7 +202,7 @@ class OcrService {
         spans.add((m.start, m.end));
       }
     }
-    for (final m in reXY.allMatches(cleaned)) {
+    for (final m in reXY.allMatches(text)) {
       if (spans.any((sp) => m.start < sp.$2 && m.end > sp.$1)) continue;
       final s = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
       final w = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
@@ -151,31 +212,60 @@ class OcrService {
       }
     }
 
-    // Bare number pairs (handwritten lists): large X (~7 digits) + Y
-    if (parsed.isEmpty) {
-      final nums = RegExp(r'[+-]?\d{4,10}(?:\.\d+)?')
-          .allMatches(cleaned)
-          .map((m) => double.tryParse(m.group(0)!))
-          .whereType<double>()
-          .toList();
-      // Heuristic: southing typically 1.5e6–3.2e6, westing |y|<2e5
-      for (var i = 0; i + 1 < nums.length; i++) {
-        final a = nums[i];
-        final b = nums[i + 1];
-        if (b.abs() >= 1500000 && b.abs() <= 3200000 && a.abs() <= 200000) {
-          parsed.add(ParsedLoPair(westing: a, southing: b));
-          i++;
-        } else if (a.abs() >= 1500000 &&
-            a.abs() <= 3200000 &&
-            b.abs() <= 200000) {
-          parsed.add(ParsedLoPair(westing: b, southing: a));
-          i++;
-        }
+    if (parsed.isNotEmpty) return parsed;
+
+    // Beacon / Land Board table rows (header optional):
+    //   A  -255124.38   -7604978.00
+    // Prefer Y then X column order. Skip Constants 0/0 and bearings.
+    final beaconPairs = _parseBeaconTablePairs(text);
+    if (beaconPairs.isNotEmpty) return beaconPairs;
+
+    // Bare number pairs (handwritten lists): large X + Y
+    final nums = RegExp(r'[+-]?\d{4,10}(?:\.\d+)?')
+        .allMatches(text)
+        .map((m) => double.tryParse(m.group(0)!))
+        .whereType<double>()
+        .toList();
+    for (var i = 0; i + 1 < nums.length; i++) {
+      final pair = _pairFromTwo(nums[i], nums[i + 1]);
+      if (pair != null) {
+        parsed.add(pair);
+        i++;
       }
     }
 
     return parsed;
   }
+
+  /// Parse Land Board beacon / co-ordinate table rows into Lo pairs.
+  ///
+  /// Only letter-labeled rows (A/B/C…) are accepted here so handwritten
+  /// bare lists still flow through the sequential bare-pair path.
+  static List<ParsedLoPair> _parseBeaconTablePairs(String text) {
+    final pairs = <ParsedLoPair>[];
+    final labeledRow = RegExp(
+      r'^\s*[A-Za-z]\b\s*([+-]?\d{4,10}(?:\.\d+)?)\s+([+-]?\d{4,10}(?:\.\d+)?)',
+    );
+
+    for (final rawLine in text.split(RegExp(r'[\r\n]+'))) {
+      final line = rawLine.trim();
+      if (line.isEmpty) continue;
+      final lower = line.toLowerCase();
+      if (lower.contains('constant')) continue;
+      if (_bearingLike.hasMatch(line)) continue;
+
+      final labeled = labeledRow.firstMatch(line);
+      if (labeled == null) continue;
+      final a = double.tryParse(labeled.group(1)!);
+      final b = double.tryParse(labeled.group(2)!);
+      if (a == null || b == null) continue;
+      if (a.abs() < 1e-6 && b.abs() < 1e-6) continue;
+      final pair = _pairFromTwo(a, b);
+      if (pair != null) pairs.add(pair);
+    }
+    return pairs;
+  }
+
 
   /// Copy bytes into app temp dir so ML Kit always gets a readable file path.
   Future<File> _materializeLocalImage(String originalPath, Uint8List bytes) async {
