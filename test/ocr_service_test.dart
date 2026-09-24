@@ -138,9 +138,11 @@ void main() {
       expect(OcrService.cleanupOcrDigitConfusions('2551S4'), '255154');
     });
 
-    test('detectSuggestedZone from LO 25 / System LO25 headers', () {
+    test('detectSuggestedZone from LO 25 / System LO25 / LO. 27 headers', () {
       expect(OcrService.detectSuggestedZone('Plot NN-48   LO 25'), 25);
       expect(OcrService.detectSuggestedZone('System LO25 Cape'), 25);
+      expect(OcrService.detectSuggestedZone('CO-ORDINATES System LO. 27'), 27);
+      expect(OcrService.detectSuggestedZone('CO-ORDINATES System LO. 27\u00b0'), 27);
       expect(OcrService.detectSuggestedZone('no zone here'), isNull);
     });
 
@@ -159,6 +161,75 @@ void main() {
       final result = OcrService.parseRecognizedText(text);
       expect(result.pairs.length, 6);
       expect(result.suggestedZone, 25);
+    });
+
+
+    test('normalizes European comma decimals (LO27 Land Board)', () {
+      expect(
+        OcrService.normalizeLoNumberText('+103 208,35   + 2 702 523,47'),
+        '+103208.35   +2702523.47',
+      );
+      expect(
+        OcrService.normalizeLoNumberText('+102825,87'),
+        '+102825.87',
+      );
+    });
+
+    test('parses Bokaa LO27 beacon table with 4 corners + zone 27', () {
+      // Photo-of-monitor PDF: space thousands, comma decimals, leading +.
+      final text = [
+        'CO-ORDINATES System LO. 27\u00b0',
+        'Beacon     Y                X',
+        '+ 0,00            + 0,00',
+        'A  +103 208,35   + 2 702 523,47',
+        'B  +102 825,87   + 2 702 748,44',
+        'C  +103 190,55   + 2 702 993,47',
+        'D  +103 510,96   + 2 702 809,52',
+        'BAKGATLA TRIBAL TERRITORY',
+        '16.1541 hectares',
+        '6911 BOKAA',
+      ].join('\n');
+      final result = OcrService.parseRecognizedText(text);
+      expect(result.pairs.length, 4);
+      expect(result.suggestedZone, 27);
+      expect(result.pairs[0].westing, closeTo(103208.35, 0.01));
+      expect(result.pairs[0].southing, closeTo(2702523.47, 0.01));
+      expect(result.pairs[1].westing, closeTo(102825.87, 0.01));
+      expect(result.pairs[1].southing, closeTo(2702748.44, 0.01));
+      expect(result.pairs[2].westing, closeTo(103190.55, 0.01));
+      expect(result.pairs[2].southing, closeTo(2702993.47, 0.01));
+      expect(result.pairs[3].westing, closeTo(103510.96, 0.01));
+      expect(result.pairs[3].southing, closeTo(2702809.52, 0.01));
+      expect(result.declaredHectares, closeTo(16.1541, 0.001));
+    });
+
+    test('LO27 table keeps all 4 corners even if one Y/X label matches', () {
+      // Regression: a single Y…X hit used to short-circuit and drop B/C/D.
+      final text = [
+        'CO-ORDINATES System LO. 27\u00b0',
+        'Y = +103 208,35  X = + 2 702 523,47',
+        'B  +102 825,87   + 2 702 748,44',
+        'C  +103 190,55   + 2 702 993,47',
+        'D  +103 510,96   + 2 702 809,52',
+      ].join('\n');
+      final result = OcrService.parseRecognizedText(text);
+      expect(result.pairs.length, 4);
+      expect(result.suggestedZone, 27);
+      expect(result.pairs[0].westing, closeTo(103208.35, 0.01));
+      expect(result.pairs[3].westing, closeTo(103510.96, 0.01));
+    });
+
+    test('LO27 rows with inline Y/X tags after beacon letters', () {
+      final text = [
+        'System LO. 27\u00b0',
+        'A Y +103 208,35 X + 2 702 523,47',
+        'B Y +102 825,87 X + 2 702 748,44',
+        'C Y +103 190,55 X + 2 702 993,47',
+        'D Y +103 510,96 X + 2 702 809,52',
+      ].join('\n');
+      final pairs = OcrService.parseLoCoordinates(text);
+      expect(pairs.length, 4);
+      expect(pairs[2].southing, closeTo(2702993.47, 0.01));
     });
 
     test('negative X pairs survive parse for converter normalize', () {

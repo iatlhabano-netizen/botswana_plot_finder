@@ -146,10 +146,10 @@ class OcrService {
     return s;
   }
 
-  /// Detect Lo zone from headers: "LO 25", "System LO25", "LO25".
+  /// Detect Lo zone from headers: "LO 25", "System LO25", "LO. 27°", "LO25".
   static int? detectSuggestedZone(String text) {
     final m = RegExp(
-      r'(?:system\s+)?lo\s*([0-9]{2})\b',
+      r'(?:system\s+)?lo\.?\s*([0-9]{2})\b',
       caseSensitive: false,
     ).firstMatch(text);
     if (m == null) return null;
@@ -169,15 +169,30 @@ class OcrService {
   /// Reject tiny OCR junk (e.g. 123 / 456) while allowing real |Y| ~ tens of km.
   static const double _minWestingAbs = 1000;
 
-  /// Collapse OCR artifacts in Lo numbers: spaced signs, spaced/comma thousands.
+  /// Collapse OCR artifacts in Lo numbers: spaced signs, spaced/comma thousands,
+  /// and European comma decimals (Land Board LO27 style).
   ///
   /// Examples: `- 255 124.38` → `-255124.38`, `-7 604 978.00` → `-7604978.00`,
-  /// `255,124.38` → `255124.38`. Leaves decimal points alone; does not touch
-  /// bearings like `1.20.43` (multiple dots).
+  /// `255,124.38` → `255124.38`, `+103 208,35` → `+103208.35`,
+  /// `+ 2 702 523,47` → `+2702523.47`. Leaves bearings like `1.20.43` alone.
   static String normalizeLoNumberText(String text) {
     var s = text;
     // Spaced sign before a digit: "- 255" / "+ 7" → "-255" / "+7"
     s = s.replaceAllMapped(RegExp(r'([+-])\s+(?=\d)'), (m) => m.group(1)!);
+
+    // European / Land Board: spaced thousands + comma decimals
+    // e.g. 103 208,35 / 2 702 523,47 → 103208.35 / 2702523.47
+    s = s.replaceAllMapped(
+      RegExp(r'(?<![\d.])\d{1,3}(?:\s\d{3})+,\d{1,3}(?!\d)'),
+      (m) => m.group(0)!.replaceAll(RegExp(r'\s'), '').replaceAll(',', '.'),
+    );
+
+    // European unspaced with 1–2 decimal digits (avoid ,ddd US thousands):
+    // 103208,35 → 103208.35
+    s = s.replaceAllMapped(
+      RegExp(r'(?<![\d.])\d{4,12},\d{1,2}(?!\d)'),
+      (m) => m.group(0)!.replaceAll(',', '.'),
+    );
 
     // US/OCR thousands commas: 255,124.38 or 2,609,149
     s = s.replaceAllMapped(
@@ -239,8 +254,13 @@ class OcrService {
       final w = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
       final s = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
       if (w != null && s != null) {
-        parsed.add(ParsedLoPair(westing: w, southing: s));
-        spans.add((m.start, m.end));
+        final pair = _pairFromTwo(w, s) ?? ParsedLoPair(westing: w, southing: s);
+        // Only keep plausible Lo magnitudes from labeled Y/X (avoids +0,00 junk).
+        if (_isPlausibleWesting(pair.westing) &&
+            _isPlausibleSouthing(pair.southing)) {
+          parsed.add(pair);
+          spans.add((m.start, m.end));
+        }
       }
     }
     for (final m in reXY.allMatches(text)) {
@@ -248,18 +268,23 @@ class OcrService {
       final s = double.tryParse(m.group(1)!.replaceAll(RegExp(r'\s'), ''));
       final w = double.tryParse(m.group(2)!.replaceAll(RegExp(r'\s'), ''));
       if (w != null && s != null) {
-        parsed.add(ParsedLoPair(westing: w, southing: s));
-        spans.add((m.start, m.end));
+        final pair = _pairFromTwo(w, s) ?? ParsedLoPair(westing: w, southing: s);
+        if (_isPlausibleWesting(pair.westing) &&
+            _isPlausibleSouthing(pair.southing)) {
+          parsed.add(pair);
+          spans.add((m.start, m.end));
+        }
       }
     }
 
-    if (parsed.isNotEmpty) return parsed;
-
     // Beacon / Land Board table rows (header optional):
     //   A  -255124.38   -7604978.00
-    // Prefer Y then X column order. Skip Constants 0/0 and bearings.
+    //   A  +103208.35   +2702523.47
+    // Merge Y/X-labeled hits with letter-labeled beacon rows so a single
+    // accidental "Y … X …" match cannot drop the remaining A/B/C/D corners.
     final beaconPairs = _parseBeaconTablePairs(text);
-    if (beaconPairs.isNotEmpty) return beaconPairs;
+    final merged = _mergeUniquePairs(parsed, beaconPairs);
+    if (merged.isNotEmpty) return merged;
 
     // Bare number pairs (handwritten lists): large X + Y
     final nums = RegExp(r'[+-]?\d{4,10}(?:\.\d+)?')
@@ -278,14 +303,34 @@ class OcrService {
     return parsed;
   }
 
+
+  /// Append [extra] pairs not already present in [base] (0.05 m tolerance).
+  static List<ParsedLoPair> _mergeUniquePairs(
+    List<ParsedLoPair> base,
+    List<ParsedLoPair> extra,
+  ) {
+    final out = <ParsedLoPair>[...base];
+    for (final p in extra) {
+      final dup = out.any((q) =>
+          (q.westing - p.westing).abs() < 0.05 &&
+          (q.southing - p.southing).abs() < 0.05);
+      if (!dup) out.add(p);
+    }
+    return out;
+  }
+
   /// Parse Land Board beacon / co-ordinate table rows into Lo pairs.
   ///
   /// Only letter-labeled rows (A/B/C…) are accepted here so handwritten
   /// bare lists still flow through the sequential bare-pair path.
+  /// Allows optional Y/X column tags after the beacon letter.
   static List<ParsedLoPair> _parseBeaconTablePairs(String text) {
     final pairs = <ParsedLoPair>[];
     final labeledRow = RegExp(
-      r'^\s*[A-Za-z]\b\s*([+-]?\d{4,10}(?:\.\d+)?)\s+([+-]?\d{4,10}(?:\.\d+)?)',
+      r'^\s*[A-Za-z]\b(?:\s*[YyXx]\b)?\s*'
+      r'([+-]?\d{4,12}(?:\.\d+)?)\s+'
+      r'(?:[XxYy]\b\s*)?'
+      r'([+-]?\d{4,12}(?:\.\d+)?)',
     );
 
     for (final rawLine in text.split(RegExp(r'[\r\n]+'))) {
