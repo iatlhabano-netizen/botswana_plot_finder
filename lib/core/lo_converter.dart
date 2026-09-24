@@ -57,8 +57,10 @@ class LoConverter {
       case 'LS':
         return const [DatumOption(key: 'ls_cape', label: 'Cape Datum')];
       default:
+        // Order: Land Board default Cape/BTRS, ArcGIS 1114, BNGRS02/WGS84.
         return const [
           DatumOption(key: 'bw_cape', label: 'Cape / BTRS (Land Board Lo)'),
+          DatumOption(key: 'bw_arcgis', label: 'ArcGIS Arc1950→WGS84 (Botswana)'),
           DatumOption(key: 'bw_btrs02', label: 'BNGRS02 / WGS84 (GPS)'),
         ];
     }
@@ -79,19 +81,24 @@ class LoConverter {
       case 'bw_btrs02':
       case 'wgs84':
         return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs';
+      case 'bw_cape':
+        // Pathfinder/Land Board field default (pre-4.6.2); not SA Cape 1128.
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-87,-105,-189,0,0,0,0 +units=m +no_defs';
+      case 'bw_arcgis':
+        // Esri WKID 1114 / EPSG:1114 Arc_1950_To_WGS_1984_2 (Botswana), ~7 m.
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-138,-105,-289,0,0,0,0 +units=m +no_defs';
       case 'za_cape':
       case 'sz_cape':
       case 'ls_cape':
-      case 'bw_cape':
-        // EPSG Cape → WGS84 Helmert (same as ZA Cape / EPSG:4222→4326 common params)
+        // SA Cape EPSG/ArcGIS Cape_To_WGS_1984_1 (WKID 1128).
         return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
       case 'na_schwarzeck':
         return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +ellps=bessel +towgs84=616,97,-251,0,0,0,0 +units=m +no_defs';
       case 'zw_arc1950':
         return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-142.5,-96.2,-291.6,0,0,0,0 +units=m +no_defs';
       default:
-        // Fallback: same EPSG Cape Helmert as bw_cape / za_cape
-        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-136,-108,-292,0,0,0,0 +units=m +no_defs';
+        // Fallback: Land Board Cape/BTRS (same as bw_cape).
+        return '+proj=tmerc +lat_0=0 +lon_0=$zone +k=1 +x_0=0 +y_0=0 +a=6378249.145 +rf=293.4663076563986 +towgs84=-87,-105,-189,0,0,0,0 +units=m +no_defs';
     }
   }
 

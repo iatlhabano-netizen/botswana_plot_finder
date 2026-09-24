@@ -14,8 +14,9 @@ import 'dart:math' as math;
 /// - Absolute WGS84 for C1 is a documented snapshot of this converter —
 ///   if you change datum defs, update these goldens deliberately.
 ///
-/// v4.6.2: bw_cape Helmert aligned to EPSG Cape (-136,-108,-292); previously
-/// used -87,-105,-189 (~115 m horizontal shift at sample).
+/// v4.6.3: bw_cape restored to Pathfinder/Land Board default
+/// (-87,-105,-189). v4.6.2 wrongly used SA Cape 1128 (-136,-108,-292).
+/// New bw_arcgis = Esri WKID 1114 / EPSG:1114 (-138,-105,-289).
 void main() {
   const zone = 25;
   const datum = 'bw_cape';
@@ -38,9 +39,9 @@ void main() {
     // Snapshot golden — southern Botswana / greater Gaborone belt
     expect(pt.latitude, closeTo(-23.58, 0.5));
     expect(pt.longitude, closeTo(25.72, 0.5));
-    // Tighter golden after EPSG Cape Helmert (-136,-108,-292)
-    expect(pt.latitude, closeTo(-23.58438681951946, 1e-7));
-    expect(pt.longitude, closeTo(25.727312019898676, 1e-7));
+    // Tighter golden after restoring Land Board Cape (-87,-105,-189)
+    expect(pt.latitude, closeTo(-23.583370327700585, 1e-7));
+    expect(pt.longitude, closeTo(25.727130120587024, 1e-7));
   });
 
   test('round-trip Lo → WGS84 → Lo preserves metres (~2 m)', () {
@@ -56,6 +57,29 @@ void main() {
           reason: 'Y round-trip for $y/$x');
       expect(back.southing, closeTo(x, 2.0),
           reason: 'X round-trip for $y/$x');
+    }
+  });
+
+  test('bw_arcgis Arc1950→WGS84 WKID 1114 sample + round-trip', () {
+    final pt = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: 'bw_arcgis',
+    );
+    expect(pt.latitude, closeTo(-23.584363799042357, 1e-7));
+    expect(pt.longitude, closeTo(25.727347001501972, 1e-7));
+    for (final (y, x) in sample) {
+      final wgs = LoConverter.toWgs84(
+        westing: y,
+        southing: x,
+        zone: zone,
+        datumKey: 'bw_arcgis',
+      );
+      final back =
+          LoConverter.fromWgs84(wgs, zone: zone, datumKey: 'bw_arcgis');
+      expect(back.westing, closeTo(y, 2.0));
+      expect(back.southing, closeTo(x, 2.0));
     }
   });
 
@@ -102,6 +126,17 @@ void main() {
     expect(back.southing, closeTo(x, 2.0));
   });
 
+  test('za_cape stays SA EPSG/ArcGIS 1128 params', () {
+    final pt = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: 'za_cape',
+    );
+    expect(pt.latitude, closeTo(-23.58438681951946, 1e-7));
+    expect(pt.longitude, closeTo(25.727312019898676, 1e-7));
+  });
+
   test('negative certificate X matches positive X (southern hemisphere)', () {
     final pos = LoConverter.toWgs84(
       westing: -74283.0,
@@ -118,6 +153,21 @@ void main() {
     expect(neg.latitude, closeTo(pos.latitude, 1e-7));
     expect(neg.longitude, closeTo(pos.longitude, 1e-7));
     expect(neg.latitude, lessThan(0));
+
+    final gisPos = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: 'bw_arcgis',
+    );
+    final gisNeg = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: -2609149.0,
+      zone: zone,
+      datumKey: 'bw_arcgis',
+    );
+    expect(gisNeg.latitude, closeTo(gisPos.latitude, 1e-7));
+    expect(gisNeg.longitude, closeTo(gisPos.longitude, 1e-7));
   });
 
   test('Cape vs BNGRS02 horizontal delta ~100–300 m at sample', () {
@@ -146,11 +196,14 @@ void main() {
     expect(metres, lessThan(400));
   });
 
-  test('BW datum labels clarify Land Board vs GPS', () {
+  test('BW datum labels order: Cape, ArcGIS, BNGRS02', () {
     final d = LoConverter.availableDatums('BW');
-    expect(d.any((o) => o.key == 'bw_cape' && o.label.contains('Land Board')),
-        isTrue);
-    expect(
-        d.any((o) => o.key == 'bw_btrs02' && o.label.contains('GPS')), isTrue);
+    expect(d.length, 3);
+    expect(d[0].key, 'bw_cape');
+    expect(d[0].label.contains('Land Board'), isTrue);
+    expect(d[1].key, 'bw_arcgis');
+    expect(d[1].label.contains('ArcGIS'), isTrue);
+    expect(d[2].key, 'bw_btrs02');
+    expect(d[2].label.contains('GPS'), isTrue);
   });
 }

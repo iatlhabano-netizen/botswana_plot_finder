@@ -520,7 +520,7 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                       labelText: 'Datum',
                       border: OutlineInputBorder(),
                       helperText:
-                          'Land Board certificates → Cape/BTRS; phone GPS maps → BNGRS02/WGS84',
+                          'Land Board default → Cape/BTRS; ArcGIS ArcMap/Pro → ArcGIS Arc1950→WGS84 (WKID 1114); GPS maps → BNGRS02/WGS84',
                       helperMaxLines: 2,
                     ),
                     items: datums
