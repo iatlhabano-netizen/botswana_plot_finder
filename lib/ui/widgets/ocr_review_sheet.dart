@@ -13,12 +13,19 @@ class OcrReviewOutcome {
   final String rawText;
   /// 'replace' | 'append'
   final String action;
+  final int? suggestedZone;
   const OcrReviewOutcome({
     required this.pairs,
     required this.rawText,
     required this.action,
     this.declaredHectares,
+    this.suggestedZone,
   });
+}
+
+/// Sentinel used when the user picks "Paste coordinate text" (no camera).
+class _PasteSource {
+  const _PasteSource();
 }
 
 /// Shared OCR scan + review for Plot Finder and Area Calculator.
@@ -28,7 +35,7 @@ class OcrReviewFlow {
     required BuildContext context,
     required OcrService ocr,
   }) async {
-    final source = await showModalBottomSheet<ImageSource>(
+    final source = await showModalBottomSheet<Object>(
       context: context,
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -42,10 +49,20 @@ class OcrReviewFlow {
             title: const Text('Choose from gallery'),
             onTap: () => Navigator.pop(ctx, ImageSource.gallery),
           ),
+          ListTile(
+            leading: const Icon(Icons.paste),
+            title: const Text('Paste coordinate text'),
+            subtitle: const Text('Skip camera — paste Y/X or beacon table'),
+            onTap: () => Navigator.pop(ctx, const _PasteSource()),
+          ),
         ]),
       ),
     );
     if (source == null || !context.mounted) return null;
+
+    if (source is _PasteSource) {
+      return _pasteAndReview(context: context);
+    }
 
     // Loading dialog while ML Kit runs
     showDialog<void>(
@@ -65,7 +82,7 @@ class OcrReviewFlow {
     OcrScanResult? result;
     Object? error;
     try {
-      result = await ocr.scan(source);
+      result = await ocr.scan(source as ImageSource);
     } catch (e) {
       error = e;
     }
@@ -80,16 +97,66 @@ class OcrReviewFlow {
       return null;
     }
     if (result == null) return null;
+
+    // Empty pairs but non-empty raw OCR → fallback review (do not snackbar-bail).
     if (result.pairs.isEmpty) {
+      if (result.rawText.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'No coordinates found. Try better lighting or clearer numbers.'),
+          ),
+        );
+        return null;
+      }
+      return showOcrReviewSheet(context: context, result: result);
+    }
+
+    return showOcrReviewSheet(context: context, result: result);
+  }
+
+  static Future<OcrReviewOutcome?> _pasteAndReview({
+    required BuildContext context,
+  }) async {
+    final pasted = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        final ctrl = TextEditingController();
+        return AlertDialog(
+          title: const Text('Paste coordinate text'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: TextField(
+              controller: ctrl,
+              maxLines: 12,
+              decoration: const InputDecoration(
+                hintText:
+                    'Paste Y/X lines or a beacon table (e.g. A  -255124  -7604978)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text),
+              child: const Text('Parse'),
+            ),
+          ],
+        );
+      },
+    );
+    if (pasted == null || !context.mounted) return null;
+    if (pasted.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-              'No coordinates found. Try better lighting or clearer numbers.'),
-        ),
+        const SnackBar(content: Text('Nothing pasted.')),
       );
       return null;
     }
-
+    final result = OcrService.parseRecognizedText(pasted);
     return showOcrReviewSheet(context: context, result: result);
   }
 
@@ -115,14 +182,19 @@ class _OcrReviewBody extends StatefulWidget {
 }
 
 class _OcrReviewBodyState extends State<_OcrReviewBody> {
-  late final List<TextEditingController> _y;
-  late final List<TextEditingController> _x;
+  late List<TextEditingController> _y;
+  late List<TextEditingController> _x;
   late final TextEditingController _ha;
+  late final TextEditingController _paste;
+  late String _rawText;
+  late int? _suggestedZone;
   bool _rawExpanded = false;
 
   @override
   void initState() {
     super.initState();
+    _rawText = widget.result.rawText;
+    _suggestedZone = widget.result.suggestedZone;
     _y = [
       for (final p in widget.result.pairs)
         TextEditingController(text: formatLoCoord(p.westing))
@@ -131,24 +203,87 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
       for (final p in widget.result.pairs)
         TextEditingController(text: formatLoCoord(p.southing))
     ];
+    // Empty-pairs fallback: start with one blank editable row.
+    if (_y.isEmpty) {
+      _y.add(TextEditingController());
+      _x.add(TextEditingController());
+    }
     _ha = TextEditingController(
       text: widget.result.declaredHectares?.toStringAsFixed(2) ?? '',
     );
+    _paste = TextEditingController(text: _rawText);
+    // Expand raw when parse failed so user can edit/re-parse.
+    _rawExpanded = widget.result.pairs.isEmpty;
   }
 
   @override
   void dispose() {
-    for (final c in [..._y, ..._x, _ha]) {
+    for (final c in [..._y, ..._x, _ha, _paste]) {
       c.dispose();
     }
     super.dispose();
   }
 
+  void _applyPairs(List<ParsedLoPair> pairs, {double? ha, int? zone}) {
+    for (final c in [..._y, ..._x]) {
+      c.dispose();
+    }
+    setState(() {
+      _y = [
+        for (final p in pairs)
+          TextEditingController(text: formatLoCoord(p.westing))
+      ];
+      _x = [
+        for (final p in pairs)
+          TextEditingController(text: formatLoCoord(p.southing))
+      ];
+      if (_y.isEmpty) {
+        _y.add(TextEditingController());
+        _x.add(TextEditingController());
+      }
+      if (ha != null) _ha.text = ha.toStringAsFixed(2);
+      if (zone != null) _suggestedZone = zone;
+    });
+  }
+
+  void _parseAgain() {
+    final text = _paste.text;
+    final result = OcrService.parseRecognizedText(text);
+    _rawText = result.rawText;
+    _applyPairs(
+      result.pairs,
+      ha: result.declaredHectares,
+      zone: result.suggestedZone,
+    );
+    if (result.pairs.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              'Still no Y/X pairs. Edit the text or enter corners manually.'),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Parsed ${result.pairs.length} corner(s).')),
+      );
+    }
+  }
+
+  void _addRow() {
+    setState(() {
+      _y.add(TextEditingController());
+      _x.add(TextEditingController());
+    });
+  }
+
   List<ParsedLoPair>? _collect() {
     final pairs = <ParsedLoPair>[];
     for (var i = 0; i < _y.length; i++) {
-      final w = double.tryParse(_y[i].text.trim());
-      final s = double.tryParse(_x[i].text.trim());
+      final yt = _y[i].text.trim();
+      final xt = _x[i].text.trim();
+      if (yt.isEmpty && xt.isEmpty) continue;
+      final w = double.tryParse(yt);
+      final s = double.tryParse(xt);
       if (w == null || s == null) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Fix Y/X on row ${i + 1} before accepting.')),
@@ -156,6 +291,13 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
         return null;
       }
       pairs.add(ParsedLoPair(westing: w, southing: s));
+    }
+    if (pairs.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Enter at least one Y/X corner before accepting.')),
+      );
+      return null;
     }
     return pairs;
   }
@@ -169,8 +311,9 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
       OcrReviewOutcome(
         pairs: pairs,
         declaredHectares: ha ?? widget.result.declaredHectares,
-        rawText: widget.result.rawText,
+        rawText: _rawText,
         action: action,
+        suggestedZone: _suggestedZone,
       ),
     );
   }
@@ -178,6 +321,7 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
   @override
   Widget build(BuildContext context) {
     final bottom = MediaQuery.of(context).viewInsets.bottom;
+    final emptyParse = widget.result.pairs.isEmpty;
     return Padding(
       padding: EdgeInsets.fromLTRB(16, 0, 16, 16 + bottom),
       child: SingleChildScrollView(
@@ -185,14 +329,29 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Review scanned corners',
-                style: Theme.of(context).textTheme.titleLarge),
+            Text(
+              emptyParse
+                  ? 'OCR found text — fix or paste corners'
+                  : 'Review scanned corners',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
             const SizedBox(height: 4),
             Text(
-              'Check Y (westing) / X (southing) before filling the form. '
-              'Decimals from the certificate are kept.',
+              emptyParse
+                  ? 'No Y/X pairs were parsed automatically. Edit the raw text '
+                      'and tap Parse again, or type corners manually below.'
+                  : 'Check Y (westing) / X (southing) before filling the form. '
+                      'Decimals from the certificate are kept.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
+            if (_suggestedZone != null) ...[
+              const SizedBox(height: 6),
+              Text('Suggested Lo zone: Lo$_suggestedZone',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: PathfinderTheme.seed,
+                        fontWeight: FontWeight.w600,
+                      )),
+            ],
             const SizedBox(height: 12),
             Table(
               columnWidths: const {
@@ -257,7 +416,15 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
                   ]),
               ],
             ),
-            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: _addRow,
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('Add row'),
+              ),
+            ),
+            const SizedBox(height: 8),
             TextField(
               controller: _ha,
               keyboardType:
@@ -270,20 +437,27 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
             ),
             const SizedBox(height: 8),
             ExpansionTile(
-              title: const Text('Raw OCR text'),
+              title: const Text('Raw OCR / paste text'),
               initiallyExpanded: false,
               onExpansionChanged: (v) => setState(() => _rawExpanded = v),
               children: [
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(10),
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  child: SelectableText(
-                    widget.result.rawText.isEmpty
-                        ? '(empty)'
-                        : widget.result.rawText,
-                    style: const TextStyle(
-                        fontFamily: 'monospace', fontSize: 11),
+                TextField(
+                  controller: _paste,
+                  maxLines: 8,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: 'Paste or edit OCR text here',
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton.tonalIcon(
+                    onPressed: _parseAgain,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('Parse again'),
                   ),
                 ),
               ],

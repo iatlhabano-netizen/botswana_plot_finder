@@ -13,10 +13,13 @@ class OcrScanResult {
   final List<ParsedLoPair> pairs;
   final double? declaredHectares;
   final String rawText;
+  /// Lo zone inferred from certificate headers like "LO 25" / "System LO25".
+  final int? suggestedZone;
   const OcrScanResult({
     required this.pairs,
     required this.rawText,
     this.declaredHectares,
+    this.suggestedZone,
   });
 }
 
@@ -44,11 +47,11 @@ class OcrService {
     try {
       photo = await _picker.pickImage(
         source: source,
-        maxWidth: 2600,
-        maxHeight: 2600,
+        maxWidth: 3200,
+        maxHeight: 3200,
         // Force JPEG recompression on Android — avoids HEIC/null-bitmap NPEs
         // inside ML Kit InputImage.fromFilePath.
-        imageQuality: 90,
+        imageQuality: 95,
         requestFullMetadata: false,
       );
     } on PlatformException catch (e) {
@@ -109,13 +112,51 @@ class OcrService {
 
   /// Pure parsing of OCR text into Lo pairs + declared hectares (testable).
   static OcrScanResult parseRecognizedText(String text) {
-    final cleaned = text.replaceAll(RegExp(r'[oO](?=\d)'), '0');
+    final cleaned = cleanupOcrDigitConfusions(
+      text.replaceAll(RegExp(r'[oO](?=\d)'), '0'),
+    );
     final pairs = parseLoCoordinates(cleaned);
     return OcrScanResult(
       pairs: pairs,
       rawText: cleaned,
       declaredHectares: AreaAuditor.extractStatedArea(cleaned),
+      suggestedZone: detectSuggestedZone(cleaned),
     );
+  }
+
+  /// Fix common OCR letter/digit swaps inside numeric contexts.
+  ///
+  /// `l`/`I` → `1`, and `S`/`s` → `5` when flanked by digits (or after a sign).
+  static String cleanupOcrDigitConfusions(String text) {
+    var s = text;
+    // l or I between digits / after sign / before digit group
+    s = s.replaceAllMapped(
+      RegExp(r'(?<=[\d+-])[lI](?=\d)'),
+      (_) => '1',
+    );
+    s = s.replaceAllMapped(
+      RegExp(r'(?<=\d)[lI](?=[\d.\s]|$)'),
+      (_) => '1',
+    );
+    // S/s as 5 between digits (not in words like "System" — require digit neighborship)
+    s = s.replaceAllMapped(
+      RegExp(r'(?<=\d)[Ss](?=\d)'),
+      (_) => '5',
+    );
+    return s;
+  }
+
+  /// Detect Lo zone from headers: "LO 25", "System LO25", "LO25".
+  static int? detectSuggestedZone(String text) {
+    final m = RegExp(
+      r'(?:system\s+)?lo\s*([0-9]{2})\b',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (m == null) return null;
+    final z = int.tryParse(m.group(1)!);
+    if (z == null) return null;
+    const known = {11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33};
+    return known.contains(z) ? z : null;
   }
 
   /// Botswana Lo plausible southing |X| (metres from equator, Capricorn belt).

@@ -130,6 +130,48 @@ void main() {
     });
   });
 
+  group('OcrService cleanup / zone / paste parse', () {
+    test('cleanupOcrDigitConfusions fixes l/I→1 and S→5 in numbers', () {
+      final cleaned = OcrService.cleanupOcrDigitConfusions('Y -74l283 X 2609I49');
+      expect(cleaned.contains('741283'), isTrue);
+      expect(cleaned.contains('2609149'), isTrue);
+      expect(OcrService.cleanupOcrDigitConfusions('2551S4'), '255154');
+    });
+
+    test('detectSuggestedZone from LO 25 / System LO25 headers', () {
+      expect(OcrService.detectSuggestedZone('Plot NN-48   LO 25'), 25);
+      expect(OcrService.detectSuggestedZone('System LO25 Cape'), 25);
+      expect(OcrService.detectSuggestedZone('no zone here'), isNull);
+    });
+
+    test('parseRecognizedText suggests zone and keeps NN-48 6 corners', () {
+      const text = '''
+        DEPARTMENT OF LANDS
+        Plot NN-48   LO 25
+        Beacon     Y                X
+        A  - 255 124.38   -7 604 978.00
+        B  - 254 977.64   -7 698 730.00
+        C  - 249 093.48   -7 698 467.50
+        D  - 249 103.50   -7 698 493.00
+        E  - 249 102.66   -7 604 846.50
+        F  - 255 109.17   -7 604 973.00
+      ''';
+      final result = OcrService.parseRecognizedText(text);
+      expect(result.pairs.length, 6);
+      expect(result.suggestedZone, 25);
+    });
+
+    test('negative X pairs survive parse for converter normalize', () {
+      final result = OcrService.parseRecognizedText(
+        'Y = -74283  X = -2609149\nY = -74593  X = -2609153',
+      );
+      expect(result.pairs.length, 2);
+      expect(result.pairs[0].southing, -2609149);
+      expect(result.pairs[1].southing, -2609153);
+    });
+
+  });
+
   group('OcrException', () {
     test('toString is the user message', () {
       const e = OcrException(

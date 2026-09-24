@@ -219,6 +219,10 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
         if (outcome.declaredHectares != null) {
           _declaredHa = outcome.declaredHectares;
         }
+        if (outcome.suggestedZone != null &&
+            _country.availableZones.contains(outcome.suggestedZone)) {
+          _zone = outcome.suggestedZone!;
+        }
       });
       await _persist();
       _toast('${outcome.pairs.length} corner(s) accepted');
@@ -513,7 +517,12 @@ class _PlotFinderScreenState extends State<PlotFinderScreen> {
                         ? _datum
                         : datums.first.key,
                     decoration: const InputDecoration(
-                        labelText: 'Datum', border: OutlineInputBorder()),
+                      labelText: 'Datum',
+                      border: OutlineInputBorder(),
+                      helperText:
+                          'Land Board certificates → Cape/BTRS; phone GPS maps → BNGRS02/WGS84',
+                      helperMaxLines: 2,
+                    ),
                     items: datums
                         .map((d) => DropdownMenuItem(
                             value: d.key, child: Text(d.label)))

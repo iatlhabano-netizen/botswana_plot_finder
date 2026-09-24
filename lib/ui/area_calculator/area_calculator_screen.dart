@@ -146,6 +146,10 @@ class _AreaCalculatorScreenState extends State<AreaCalculatorScreen> {
         if (outcome.declaredHectares != null) {
           _declaredHa = outcome.declaredHectares;
         }
+        if (outcome.suggestedZone != null &&
+            _country.availableZones.contains(outcome.suggestedZone)) {
+          _zone = outcome.suggestedZone!;
+        }
         _result = null;
         _errors = [];
         _warnings = [];
@@ -294,7 +298,12 @@ class _AreaCalculatorScreenState extends State<AreaCalculatorScreen> {
                           ? _datum
                           : datums.first.key,
                       decoration: const InputDecoration(
-                          labelText: 'Datum', border: OutlineInputBorder()),
+                          labelText: 'Datum',
+                          border: OutlineInputBorder(),
+                          helperText:
+                              'Land Board certificates → Cape/BTRS; phone GPS maps → BNGRS02/WGS84',
+                          helperMaxLines: 2,
+                        ),
                       items: datums
                           .map((d) => DropdownMenuItem(
                               value: d.key, child: Text(d.label)))

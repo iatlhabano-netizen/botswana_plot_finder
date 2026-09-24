@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:botswana_plot_finder/core/lo_converter.dart';
 import 'package:latlong2/latlong.dart' as ll;
+import 'dart:math' as math;
 
 /// Golden / control cases for Lo ↔ WGS84.
 ///
@@ -12,6 +13,9 @@ import 'package:latlong2/latlong.dart' as ll;
 ///   (proj4dart + Cape towgs84 parameters).
 /// - Absolute WGS84 for C1 is a documented snapshot of this converter —
 ///   if you change datum defs, update these goldens deliberately.
+///
+/// v4.6.2: bw_cape Helmert aligned to EPSG Cape (-136,-108,-292); previously
+/// used -87,-105,-189 (~115 m horizontal shift at sample).
 void main() {
   const zone = 25;
   const datum = 'bw_cape';
@@ -34,9 +38,9 @@ void main() {
     // Snapshot golden — southern Botswana / greater Gaborone belt
     expect(pt.latitude, closeTo(-23.58, 0.5));
     expect(pt.longitude, closeTo(25.72, 0.5));
-    // Tighter golden from this codebase's proj defs
-    expect(pt.latitude, closeTo(-23.555, 0.05));
-    expect(pt.longitude, closeTo(25.72, 0.05));
+    // Tighter golden after EPSG Cape Helmert (-136,-108,-292)
+    expect(pt.latitude, closeTo(-23.58438681951946, 1e-7));
+    expect(pt.longitude, closeTo(25.727312019898676, 1e-7));
   });
 
   test('round-trip Lo → WGS84 → Lo preserves metres (~2 m)', () {
@@ -72,9 +76,12 @@ void main() {
   });
 
   test('validateLo flags wild westing / southing', () {
-    expect(LoConverter.validateLo(500000, 2600000), isNotNull);
+    expect(LoConverter.validateLo(700000, 2600000), isNotNull);
     expect(LoConverter.validateLo(-74283, 100), isNotNull);
     expect(LoConverter.validateLo(-74283, 2609149), isNull);
+    // LO25-magnitude westing (~255 km) and negative certificate X
+    expect(LoConverter.validateLo(-255124, -7604978), isNull);
+    expect(LoConverter.validateLo(-255124, 7604978), isNull);
   });
 
   test('ZA Hart94 round-trip sanity (Lo29-ish Gauteng belt)', () {
@@ -93,5 +100,57 @@ void main() {
         LoConverter.fromWgs84(wgs, zone: 29, datumKey: 'za_hart94');
     expect(back.westing, closeTo(y, 2.0));
     expect(back.southing, closeTo(x, 2.0));
+  });
+
+  test('negative certificate X matches positive X (southern hemisphere)', () {
+    final pos = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: datum,
+    );
+    final neg = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: -2609149.0,
+      zone: zone,
+      datumKey: datum,
+    );
+    expect(neg.latitude, closeTo(pos.latitude, 1e-7));
+    expect(neg.longitude, closeTo(pos.longitude, 1e-7));
+    expect(neg.latitude, lessThan(0));
+  });
+
+  test('Cape vs BNGRS02 horizontal delta ~100–300 m at sample', () {
+    final cape = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: 'bw_cape',
+    );
+    final gps = LoConverter.toWgs84(
+      westing: -74283.0,
+      southing: 2609149.0,
+      zone: zone,
+      datumKey: 'bw_btrs02',
+    );
+    final dLat = (cape.latitude - gps.latitude) * math.pi / 180;
+    final dLon = (cape.longitude - gps.longitude) * math.pi / 180;
+    final lat1 = cape.latitude * math.pi / 180;
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(lat1) *
+            math.cos(gps.latitude * math.pi / 180) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    final metres = 2 * 6371000 * math.asin(math.sqrt(a));
+    expect(metres, greaterThan(80));
+    expect(metres, lessThan(400));
+  });
+
+  test('BW datum labels clarify Land Board vs GPS', () {
+    final d = LoConverter.availableDatums('BW');
+    expect(d.any((o) => o.key == 'bw_cape' && o.label.contains('Land Board')),
+        isTrue);
+    expect(
+        d.any((o) => o.key == 'bw_btrs02' && o.label.contains('GPS')), isTrue);
   });
 }
