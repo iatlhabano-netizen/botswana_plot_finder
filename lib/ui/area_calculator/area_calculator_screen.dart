@@ -68,8 +68,8 @@ class _AreaCalculatorScreenState extends State<AreaCalculatorScreen> {
     final lo = <Map<String, double>>[];
     final bad = <String>[];
     for (var i = 0; i < _corners.length; i++) {
-      final w = double.tryParse(_corners[i].y.text.trim());
-      final s = double.tryParse(_corners[i].x.text.trim());
+      final w = tryParseLoNumber(_corners[i].y.text);
+      final s = tryParseLoNumber(_corners[i].x.text);
       if (w == null || s == null) {
         bad.add('Corner ${i + 1}: enter valid Y and X (Lo metres).');
       } else {
@@ -163,8 +163,8 @@ class _AreaCalculatorScreenState extends State<AreaCalculatorScreen> {
   List<ll.LatLng> get _wgsPoints {
     final out = <ll.LatLng>[];
     for (final c in _corners) {
-      final w = double.tryParse(c.y.text.trim());
-      final s = double.tryParse(c.x.text.trim());
+      final w = tryParseLoNumber(c.y.text);
+      final s = tryParseLoNumber(c.x.text);
       if (w == null || s == null) continue;
       out.add(LoConverter.toWgs84(
         westing: w,
@@ -527,8 +527,8 @@ class _AreaCalculatorScreenState extends State<AreaCalculatorScreen> {
                         style: Theme.of(context).textTheme.titleSmall),
                     const SizedBox(height: 6),
                     ...List.generate(_corners.length, (i) {
-                      final w = double.tryParse(_corners[i].y.text.trim());
-                      final s = double.tryParse(_corners[i].x.text.trim());
+                      final w = tryParseLoNumber(_corners[i].y.text);
+                      final s = tryParseLoNumber(_corners[i].x.text);
                       if (w == null || s == null) {
                         return const SizedBox.shrink();
                       }

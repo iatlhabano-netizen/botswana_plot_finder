@@ -6,6 +6,7 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../core/lo_format.dart' as lo_fmt;
 import '../core/models.dart';
 import 'area_audit.dart';
 
@@ -112,6 +113,9 @@ class OcrService {
 
   /// Pure parsing of OCR text into Lo pairs + declared hectares (testable).
   static OcrScanResult parseRecognizedText(String text) {
+    // Zone headers like "LO25" must be read before O→0, which turns them
+    // into "L025" and hides the zone.
+    final zoneOnRaw = detectSuggestedZone(text);
     final cleaned = cleanupOcrDigitConfusions(
       text.replaceAll(RegExp(r'[oO](?=\d)'), '0'),
     );
@@ -120,7 +124,7 @@ class OcrService {
       pairs: pairs,
       rawText: cleaned,
       declaredHectares: AreaAuditor.extractStatedArea(cleaned),
-      suggestedZone: detectSuggestedZone(cleaned),
+      suggestedZone: zoneOnRaw ?? detectSuggestedZone(cleaned),
     );
   }
 
@@ -166,48 +170,15 @@ class OcrService {
   /// Botswana Lo plausible westing |Y| (metres from zone central meridian).
   static const double _maxWestingAbs = 600000;
 
-  /// Reject tiny OCR junk (e.g. 123 / 456) while allowing real |Y| ~ tens of km.
-  static const double _minWestingAbs = 1000;
+  /// Reject tiny OCR junk while still accepting a beacon a few metres from
+  /// the zone central meridian. Pairing already requires a Lo-scale southing,
+  /// so a 1 km floor was dropping real near-CM corners (Y under 1 000 m).
+  static const double _minWestingAbs = 0.5;
 
-  /// Collapse OCR artifacts in Lo numbers: spaced signs, spaced/comma thousands,
-  /// and European comma decimals (Land Board LO27 style).
-  ///
-  /// Examples: `- 255 124.38` → `-255124.38`, `-7 604 978.00` → `-7604978.00`,
-  /// `255,124.38` → `255124.38`, `+103 208,35` → `+103208.35`,
-  /// `+ 2 702 523,47` → `+2702523.47`. Leaves bearings like `1.20.43` alone.
-  static String normalizeLoNumberText(String text) {
-    var s = text;
-    // Spaced sign before a digit: "- 255" / "+ 7" → "-255" / "+7"
-    s = s.replaceAllMapped(RegExp(r'([+-])\s+(?=\d)'), (m) => m.group(1)!);
-
-    // European / Land Board: spaced thousands + comma decimals
-    // e.g. 103 208,35 / 2 702 523,47 → 103208.35 / 2702523.47
-    s = s.replaceAllMapped(
-      RegExp(r'(?<![\d.])\d{1,3}(?:\s\d{3})+,\d{1,3}(?!\d)'),
-      (m) => m.group(0)!.replaceAll(RegExp(r'\s'), '').replaceAll(',', '.'),
-    );
-
-    // European unspaced with 1–2 decimal digits (avoid ,ddd US thousands):
-    // 103208,35 → 103208.35
-    s = s.replaceAllMapped(
-      RegExp(r'(?<![\d.])\d{4,12},\d{1,2}(?!\d)'),
-      (m) => m.group(0)!.replaceAll(',', '.'),
-    );
-
-    // US/OCR thousands commas: 255,124.38 or 2,609,149
-    s = s.replaceAllMapped(
-      RegExp(r'(?<![\d.])\d{1,3}(?:,\d{3})+(?:\.\d+)?'),
-      (m) => m.group(0)!.replaceAll(',', ''),
-    );
-
-    // Spaced thousands groups: 255 124.38 / 7 604 978.00
-    s = s.replaceAllMapped(
-      RegExp(r'(?<![\d.])\d{1,3}(?:\s\d{3})+(?:\.\d+)?'),
-      (m) => m.group(0)!.replaceAll(RegExp(r'\s'), ''),
-    );
-
-    return s;
-  }
+  /// Collapse OCR artifacts in Lo numbers (implementation in lo_format.dart).
+  /// Kept on [OcrService] so existing call sites and tests stay stable.
+  static String normalizeLoNumberText(String text) =>
+      lo_fmt.normalizeLoNumberText(text);
 
   static bool _isPlausibleSouthing(double v) {
     final a = v.abs();
@@ -238,11 +209,11 @@ class OcrService {
     final text = normalizeLoNumberText(cleaned);
 
     final reYX = RegExp(
-      r'Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)',
+      r'Y\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)\s*[,;:\s]+\s*X\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)',
       caseSensitive: false,
     );
     final reXY = RegExp(
-      r'X\s*[:=]?\s*([+-]?\d[\d\s]{4,9}\d(?:\.\d+)?)\s*[,;:\s]+\s*Y\s*[:=]?\s*([+-]?\d[\d\s]{2,9}\d(?:\.\d+)?)',
+      r'X\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)\s*[,;:\s]+\s*Y\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)',
       caseSensitive: false,
     );
 
@@ -283,7 +254,10 @@ class OcrService {
     // Merge Y/X-labeled hits with letter-labeled beacon rows so a single
     // accidental "Y … X …" match cannot drop the remaining A/B/C/D corners.
     final beaconPairs = _parseBeaconTablePairs(text);
-    final merged = _mergeUniquePairs(parsed, beaconPairs);
+    final columnPairs = _parseColumnMajor(text);
+    // Column-major (all Y, then all X) is merged in, not used as a
+    // short-circuit, so a real beacon row is never dropped.
+    final merged = _mergeUniquePairs(parsed, [...beaconPairs, ...columnPairs]);
     if (merged.isNotEmpty) return merged;
 
     // Bare number pairs (handwritten lists): large X + Y
@@ -324,32 +298,201 @@ class OcrService {
   /// Only letter-labeled rows (A/B/C…) are accepted here so handwritten
   /// bare lists still flow through the sequential bare-pair path.
   /// Allows optional Y/X column tags after the beacon letter.
+  ///
+  /// ML Kit often splits a table row so the beacon letter and Y sit on one
+  /// line and X on the next (or the letter alone, then Y, then X). Those
+  /// rows are stitched before giving up — otherwise one intact corner makes
+  /// [parseLoCoordinates] return early and drop the split ones.
   static List<ParsedLoPair> _parseBeaconTablePairs(String text) {
     final pairs = <ParsedLoPair>[];
     final labeledRow = RegExp(
-      r'^\s*[A-Za-z]\b(?:\s*[YyXx]\b)?\s*'
-      r'([+-]?\d{4,12}(?:\.\d+)?)\s+'
+      r'^[A-Za-z]\b(?:\s*[YyXx]\b)?\s*'
+      r'([+-]?\d{1,12}(?:\.\d+)?)\s+'
       r'(?:[XxYy]\b\s*)?'
-      r'([+-]?\d{4,12}(?:\.\d+)?)',
+      r'([+-]?\d{1,12}(?:\.\d+)?)',
     );
+    final letterAndOne = RegExp(
+      r'^[A-Za-z]\b(?:\s*[YyXx]\b)?\s*([+-]?\d{1,12}(?:\.\d+)?)(?:\s*[XxYy]\b)?$',
+    );
+    final justNumber = RegExp(r'^[+-]?\d{1,12}(?:\.\d+)?$');
+    // Exclude Y/X — those are column headers, not beacon letters.
+    final justLetter = RegExp(r'^[A-Wa-wZz]$');
 
-    for (final rawLine in text.split(RegExp(r'[\r\n]+'))) {
-      final line = rawLine.trim();
-      if (line.isEmpty) continue;
+    final lines = text
+        .split(RegExp(r'[\r\n]+'))
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+
+    bool skip(String line) {
       final lower = line.toLowerCase();
-      if (lower.contains('constant')) continue;
-      if (_bearingLike.hasMatch(line)) continue;
+      if (lower.contains('constant')) return true;
+      if (_bearingLike.hasMatch(line)) return true;
+      return false;
+    }
 
-      final labeled = labeledRow.firstMatch(line);
-      if (labeled == null) continue;
-      final a = double.tryParse(labeled.group(1)!);
-      final b = double.tryParse(labeled.group(2)!);
-      if (a == null || b == null) continue;
-      if (a.abs() < 1e-6 && b.abs() < 1e-6) continue;
+    void addPair(String as, String bs) {
+      final a = double.tryParse(as);
+      final b = double.tryParse(bs);
+      if (a == null || b == null) return;
+      if (a.abs() < 1e-6 && b.abs() < 1e-6) return;
       final pair = _pairFromTwo(a, b);
       if (pair != null) pairs.add(pair);
     }
+
+    for (var i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      if (skip(line)) continue;
+
+      final labeled = labeledRow.firstMatch(line);
+      if (labeled != null) {
+        addPair(labeled.group(1)!, labeled.group(2)!);
+        continue;
+      }
+
+      final one = letterAndOne.firstMatch(line);
+      if (one != null && i + 1 < lines.length && !skip(lines[i + 1])) {
+        final nxt = justNumber.firstMatch(lines[i + 1]);
+        if (nxt != null) {
+          addPair(one.group(1)!, nxt.group(0)!);
+          i++;
+          continue;
+        }
+      }
+
+      if (justLetter.hasMatch(line) &&
+          i + 2 < lines.length &&
+          !skip(lines[i + 1]) &&
+          !skip(lines[i + 2])) {
+        final n1 = justNumber.firstMatch(lines[i + 1]);
+        final n2 = justNumber.firstMatch(lines[i + 2]);
+        if (n1 != null && n2 != null) {
+          addPair(n1.group(0)!, n2.group(0)!);
+          i += 2;
+        }
+      }
+    }
     return pairs;
+  }
+
+  /// ML Kit sometimes reads a certificate down the columns: every Y, then
+  /// every X (or a `Y` header, numbers, an `X` header, numbers).
+  /// Westing and southing ranges do not overlap, so a clean W,W,W,S,S,S
+  /// run zips in order. Alternating W,S,W,S is left to the bare-pair path.
+  static List<ParsedLoPair> _parseColumnMajor(String text) {
+    final lines = text
+        .split(RegExp(r'[\r\n]+'))
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+
+    bool skip(String line) {
+      final lower = line.toLowerCase();
+      if (lower.contains('constant')) return true;
+      if (_bearingLike.hasMatch(line)) return true;
+      return false;
+    }
+
+    final taggedY = <double>[];
+    final taggedX = <double>[];
+    final yLine = RegExp(
+      r'^Y\b\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)$',
+      caseSensitive: false,
+    );
+    final xLine = RegExp(
+      r'^X\b\s*[:=]?\s*([+-]?\d{1,12}(?:\.\d+)?)$',
+      caseSensitive: false,
+    );
+    for (final line in lines) {
+      if (skip(line)) continue;
+      final y = yLine.firstMatch(line);
+      if (y != null) {
+        final v = double.tryParse(y.group(1)!);
+        if (v != null && _isPlausibleWesting(v)) taggedY.add(v);
+        continue;
+      }
+      final x = xLine.firstMatch(line);
+      if (x != null) {
+        final v = double.tryParse(x.group(1)!);
+        if (v != null && _isPlausibleSouthing(v)) taggedX.add(v);
+      }
+    }
+    if (taggedY.length >= 2 && taggedY.length == taggedX.length) {
+      return [
+        for (var i = 0; i < taggedY.length; i++)
+          ParsedLoPair(westing: taggedY[i], southing: taggedX[i]),
+      ];
+    }
+
+    int? yAt;
+    int? xAt;
+    for (var i = 0; i < lines.length; i++) {
+      if (skip(lines[i])) continue;
+      if (RegExp(r'^Y$', caseSensitive: false).hasMatch(lines[i])) yAt = i;
+      if (yAt != null &&
+          i > yAt &&
+          RegExp(r'^X$', caseSensitive: false).hasMatch(lines[i])) {
+        xAt = i;
+        break;
+      }
+    }
+    if (yAt != null && xAt != null) {
+      final ys = _loneNumbers(lines, yAt + 1, xAt, southing: false);
+      final xs = _loneNumbers(lines, xAt + 1, lines.length, southing: true);
+      if (ys.length >= 2 && ys.length == xs.length) {
+        return [
+          for (var i = 0; i < ys.length; i++)
+            ParsedLoPair(westing: ys[i], southing: xs[i]),
+        ];
+      }
+    }
+
+    // No headers: one run of lone westings, then one run of lone southings.
+    final seq = <(bool, double)>[];
+    for (final line in lines) {
+      if (skip(line)) continue;
+      if (!RegExp(r'^[+-]?\d{1,12}(?:\.\d+)?$').hasMatch(line)) continue;
+      final v = double.tryParse(line);
+      if (v == null) continue;
+      if (_isPlausibleSouthing(v)) {
+        seq.add((true, v));
+      } else if (_isPlausibleWesting(v)) {
+        seq.add((false, v));
+      }
+    }
+    if (seq.length < 4) return const [];
+    final firstSouth = seq.first.$1;
+    final split = seq.indexWhere((e) => e.$1 != firstSouth);
+    if (split <= 0) return const [];
+    if (seq.skip(split).any((e) => e.$1 == firstSouth)) return const [];
+    final head = seq.sublist(0, split);
+    final tail = seq.sublist(split);
+    if (head.length != tail.length || head.length < 2) return const [];
+    return [
+      for (var i = 0; i < head.length; i++)
+        ParsedLoPair(
+          westing: firstSouth ? tail[i].$2 : head[i].$2,
+          southing: firstSouth ? head[i].$2 : tail[i].$2,
+        ),
+    ];
+  }
+
+  static List<double> _loneNumbers(
+    List<String> lines,
+    int from,
+    int to, {
+    required bool southing,
+  }) {
+    final out = <double>[];
+    for (var i = from; i < to && i < lines.length; i++) {
+      final line = lines[i];
+      if (!RegExp(r'^[+-]?\d{1,12}(?:\.\d+)?$').hasMatch(line)) continue;
+      final v = double.tryParse(line);
+      if (v == null) continue;
+      final ok = southing ? _isPlausibleSouthing(v) : _isPlausibleWesting(v);
+      if (ok) out.add(v);
+    }
+    return out;
   }
 
 

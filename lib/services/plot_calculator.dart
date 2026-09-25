@@ -1,5 +1,7 @@
 import 'dart:math';
 
+import '../core/lo_converter.dart';
+
 class BoundarySegment {
   final int fromCorner;
   final int toCorner;
@@ -47,9 +49,9 @@ class PlotCalculator {
       int nextIdx = (i + 1) % n;
 
       double y1 = corners[i]['Y']!;
-      double x1 = corners[i]['X']!;
+      double x1 = LoConverter.normalizeSouthing(corners[i]['X']!);
       double y2 = corners[nextIdx]['Y']!;
-      double x2 = corners[nextIdx]['X']!;
+      double x2 = LoConverter.normalizeSouthing(corners[nextIdx]['X']!);
 
       // Shoelace trapezoid formula: (Y_i * X_{i+1}) - (Y_{i+1} * X_i)
       shoelaceSum += (y1 * x2) - (y2 * x1);

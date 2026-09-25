@@ -44,9 +44,19 @@ class PathProjection {
 ///   (interior ? |lateral| : distToClampedFoot) + (leg == hint ? 0 : switchCost).
 /// A candidate leg must win for [dwellFixes] consecutive updates before the
 /// active leg commits (reduces flicker near bends).
+///
+/// Exception: if the active leg is already exterior and another leg is
+/// interior by a wide margin (well past the bend, not the ±switchCost
+/// dither), commit immediately. Waiting out the dwell there shows cross-track
+/// against the previous leg and reads as the wrong side.
 class LineProjector {
   static const double defaultSwitchCostM = 2.5;
   static const int defaultDwellFixes = 2;
+
+  /// Metres beyond the last vertex before the walk is "past the end".
+  /// A fraction of segment length (the old `t > 0.98` rule) fired tens of
+  /// metres early on a long pipe run.
+  static const double pastEndMarginM = 8.0;
 
   int _activeLeg = 0;
   int? _pendingLeg;
@@ -88,7 +98,11 @@ class LineProjector {
       lens.add(pr.lengthM);
     }
 
-    var best = _activeLeg.clamp(0, nSeg - 1);
+    if (_activeLeg < 0 || _activeLeg >= nSeg) {
+      _activeLeg = _activeLeg.clamp(0, nSeg - 1);
+    }
+
+    var best = _activeLeg;
     var bestScore = double.infinity;
     for (var i = 0; i < nSeg; i++) {
       final pr = projs[i];
@@ -101,7 +115,18 @@ class LineProjector {
     }
 
     if (commitDwell) {
-      if (best != _activeLeg) {
+      final activePr = projs[_activeLeg];
+      final bestPr = projs[best];
+      final decisive = best != _activeLeg &&
+          !activePr.interior &&
+          bestPr.interior &&
+          activePr.distToSegM > switchCostM * 3 &&
+          bestPr.lateralM.abs() + 1.0 < activePr.distToSegM;
+      if (decisive) {
+        _activeLeg = best;
+        _pendingLeg = null;
+        _pendCount = 0;
+      } else if (best != _activeLeg) {
         if (_pendingLeg == best) {
           _pendCount++;
           if (_pendCount >= dwellFixes) {
@@ -183,7 +208,8 @@ class LineProjector {
 
     // Prefer spherical XT for display consistency with unit tests / docs.
     final xt = LineGeo.crossTrackM(cur, a, b);
-    final pastEnd = leg == lens.length - 1 && pr.t > 0.98;
+    final beyondM = (pr.t - 1.0) * pr.lengthM;
+    final pastEnd = leg == lens.length - 1 && beyondM > pastEndMarginM;
 
     return PathProjection(
       legIndex: leg,

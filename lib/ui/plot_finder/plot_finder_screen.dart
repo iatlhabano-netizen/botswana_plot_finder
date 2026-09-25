@@ -26,8 +26,8 @@ class _CornerCtrls {
   _CornerCtrls(String yText, String xText)
       : y = TextEditingController(text: yText),
         x = TextEditingController(text: xText);
-  double? get westing => double.tryParse(y.text.trim());
-  double? get southing => double.tryParse(x.text.trim());
+  double? get westing => tryParseLoNumber(y.text);
+  double? get southing => tryParseLoNumber(x.text);
   void dispose() {
     y.dispose();
     x.dispose();

@@ -43,6 +43,25 @@ void main() {
     expect(r.perimeterMeters, closeTo(400.0, 1e-9));
   });
 
+  test('negative and mixed-sign certificate X match positive area', () {
+    final neg = [
+      for (final c in sample) {'Y': c['Y']!, 'X': -c['X']!},
+    ];
+    final pos = PlotCalculator.calculateFromLo(sample);
+    final flipped = PlotCalculator.calculateFromLo(neg);
+    expect(flipped.areaHectares, closeTo(pos.areaHectares, 1e-6));
+    expect(flipped.areaSqMeters, closeTo(pos.areaSqMeters, 0.01));
+
+    final mixed = [
+      {'Y': sample[0]['Y']!, 'X': sample[0]['X']!},
+      {'Y': sample[1]['Y']!, 'X': -sample[1]['X']!},
+      {'Y': sample[2]['Y']!, 'X': sample[2]['X']!},
+      {'Y': sample[3]['Y']!, 'X': -sample[3]['X']!},
+    ];
+    final m = PlotCalculator.calculateFromLo(mixed);
+    expect(m.areaHectares, closeTo(pos.areaHectares, 1e-6));
+  });
+
   test('fewer than 3 corners → zero area', () {
     final r = PlotCalculator.calculateFromLo([
       {'Y': 0.0, 'X': 0.0},

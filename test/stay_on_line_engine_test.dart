@@ -73,14 +73,36 @@ void main() {
       expect(stay1!.legIndex, 1);
     });
 
-    test('dwell requires 2 consecutive fixes to change leg', () {
+    test('decisive move onto the next leg commits immediately', () {
       final projector = LineProjector()..reset(leg: 0);
-      // Clearly on leg 1
+      // Clearly on leg 1 (~500 m north of the bend). Waiting out dwell here
+      // reports cross-track against the finished east leg — the wrong side.
       final onLeg1 = const ll.LatLng(-23.995, 25.01);
       final r1 = projector.project(onLeg1, [a, b, c]);
-      expect(r1!.legIndex, 0); // first sample — still dwell
-      final r2 = projector.project(onLeg1, [a, b, c]);
-      expect(r2!.legIndex, 1); // second consecutive → commit
+      expect(r1!.legIndex, 1);
+    });
+
+    test('ambiguous bend still dwells for 2 fixes', () {
+      final projector = LineProjector()..reset(leg: 0);
+      // 1 m before the bend and 10 m north: leg 0 is still interior, so the
+      // switch is not "decisive", but leg 1 is the better score.
+      final before = LineGeo.destination(b, (LineGeo.bearingDeg(a, b) + 180) % 360, 1);
+      final p = LineGeo.destination(before, 0, 10);
+      final r1 = projector.project(p, [a, b, c]);
+      expect(r1!.legIndex, 0);
+      final r2 = projector.project(p, [a, b, c]);
+      expect(r2!.legIndex, 1);
+    });
+
+    test('past-end uses metres, not 98% of a long leg', () {
+      final len = LineGeo.distanceM(a, b);
+      final brg = LineGeo.bearingDeg(a, b);
+      final short = LineGeo.destination(a, brg, len - 15);
+      final early = LineProjector.projectOnce(short, [a, b]);
+      expect(early!.pastEnd, isFalse);
+      final beyond = LineGeo.destination(a, brg, len + 20);
+      final late = LineProjector.projectOnce(beyond, [a, b]);
+      expect(late!.pastEnd, isTrue);
     });
   });
 
@@ -98,6 +120,17 @@ void main() {
       expect(h.update(0.2, 2.0), LineSide.onLine);
       h.update(3.0, 2.0); // pending RIGHT
       expect(h.update(3.0, 2.0), LineSide.right);
+    });
+
+    test('crossed to the other side is not latched on the old side', () {
+      final h = LineHysteresis(confirmSamples: 2);
+      expect(h.update(0.2, 2.0), LineSide.onLine);
+      h.update(3.0, 2.0);
+      expect(h.update(3.0, 2.0), LineSide.right);
+      // -2.0 m is left of the line, outside the enter band (1.7 m) but inside
+      // the old exit threshold (2.24 m). Must not keep saying RIGHT.
+      expect(h.update(-2.0, 2.0), LineSide.right); // first confirm sample
+      expect(h.update(-2.0, 2.0), LineSide.left);
     });
 
     test('corridor vs accuracy', () {
@@ -125,6 +158,21 @@ void main() {
       // Closed-ish ring: first and last distinct (left[0] vs right[0])
       expect(poly.first.latitude, isNot(closeTo(poly.last.latitude, 1e-9)));
     });
+
+    test('corridor width eases a spike instead of snapping', () {
+      final f = CorridorWidthFilter();
+      expect(f.update(1.8), closeTo(1.8, 1e-9));
+      // One bad accuracy sample wants 12 m. Do not jump there in one fix.
+      final stepped = f.update(12);
+      expect(stepped, lessThan(4));
+      expect(stepped, greaterThan(1.8));
+      // Shrinking back is slower than widening.
+      final back = f.update(1.8);
+      expect(f.width! - back, closeTo(0, 1e-9));
+      expect((stepped - back).abs(), closeTo(CorridorWidthFilter.shrinkStepM, 1e-9));
+      f.snap(2.5);
+      expect(f.width, closeTo(2.5, 1e-9));
+    });
   });
 
   group('smoothing EMA', () {
@@ -144,6 +192,33 @@ void main() {
       final f = s.update(a, 5, 1000);
       expect(f, isNotNull);
       expect(f!.position.latitude, closeTo(a.latitude, 1e-9));
+    });
+
+    test('grace hold does not integrate velocity through a spike', () {
+      final s = GpsSmoother();
+      var t = 0;
+      s.update(a, 5, t);
+      var pos = a;
+      SmoothedFix? before;
+      for (var i = 0; i < 6; i++) {
+        t += 1000;
+        pos = LineGeo.destination(pos, 90, 6);
+        before = s.update(pos, 5, t);
+      }
+      final spike = LineGeo.destination(pos, 0, 40);
+      final held = s.update(spike, 5, t + 1000);
+      expect(
+        LineGeo.distanceM(held!.position, before!.position),
+        lessThan(0.5),
+      );
+    });
+
+    test('inferred speed is clamped', () {
+      final s = GpsSmoother();
+      s.update(a, 1, 0);
+      final jumped = LineGeo.destination(a, 90, 20);
+      final f = s.update(jumped, 1, 50);
+      expect(f!.speedMps, lessThanOrEqualTo(GpsSmoother.maxSpeedMps + 1e-6));
     });
   });
 

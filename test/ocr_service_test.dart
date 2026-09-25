@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:botswana_plot_finder/core/lo_format.dart';
 import 'package:botswana_plot_finder/services/ocr_service.dart';
 
 void main() {
@@ -239,6 +240,111 @@ void main() {
       expect(result.pairs.length, 2);
       expect(result.pairs[0].southing, -2609149);
       expect(result.pairs[1].southing, -2609153);
+    });
+
+    test('glued LO25 header is detected before O→0 cleanup', () {
+      final result = OcrService.parseRecognizedText(
+        'System LO25 Cape\nY -74283 X 2609149',
+      );
+      expect(result.suggestedZone, 25);
+      expect(result.pairs, isNotEmpty);
+    });
+
+    test('dot-thousands comma-decimal OCR (2.702.523,47)', () {
+      expect(
+        OcrService.normalizeLoNumberText('+103.208,35 +2.702.523,47'),
+        '+103208.35 +2702523.47',
+      );
+      final pairs = OcrService.parseLoCoordinates(
+        'A +103.208,35 +2.702.523,47',
+      );
+      expect(pairs, isNotEmpty);
+      expect(pairs.first.westing, closeTo(103208.35, 0.01));
+      expect(pairs.first.southing, closeTo(2702523.47, 0.01));
+    });
+
+    test('split beacon rows (Y on one line, X on the next) keep every corner', () {
+      final text = [
+        'CO-ORDINATES System LO. 27°',
+        'A  +103 208,35',
+        '+ 2 702 523,47',
+        'B  +102 825,87',
+        '+ 2 702 748,44',
+        'C  +103 190,55   + 2 702 993,47',
+        'D',
+        '+103 510,96',
+        '+ 2 702 809,52',
+      ].join('\n');
+      final result = OcrService.parseRecognizedText(text);
+      expect(result.suggestedZone, 27);
+      expect(result.pairs.length, 4);
+      expect(result.pairs[0].westing, closeTo(103208.35, 0.01));
+      expect(result.pairs[0].southing, closeTo(2702523.47, 0.01));
+      expect(result.pairs[1].southing, closeTo(2702748.44, 0.01));
+      expect(result.pairs[3].westing, closeTo(103510.96, 0.01));
+      expect(result.pairs[3].southing, closeTo(2702809.52, 0.01));
+    });
+
+    test('near-central-meridian Y under 1 km is kept when X is Lo-scale', () {
+      final pairs = OcrService.parseLoCoordinates(
+        'A +12.50 +2702523.47\nB +80.00 +2702600.00',
+      );
+      expect(pairs.length, 2);
+      expect(pairs[0].westing, closeTo(12.50, 0.01));
+      expect(pairs[0].southing, closeTo(2702523.47, 0.01));
+      expect(pairs[1].westing, closeTo(80.0, 0.01));
+    });
+
+    test('comma-decimal hectares and typed Lo fields', () {
+      final result = OcrService.parseRecognizedText(
+        'Y +103208.35 X +2702523.47\n16,1541 hectares',
+      );
+      expect(result.declaredHectares, closeTo(16.1541, 1e-4));
+      expect(tryParseLoNumber('+103 208,35'), closeTo(103208.35, 0.01));
+      expect(tryParseLoNumber('1,000'), 1000);
+      final threeDigits = OcrService.parseRecognizedText('16,154 hectares');
+      expect(threeDigits.declaredHectares, closeTo(16.154, 1e-4));
+      final thousands = OcrService.parseRecognizedText('1,000 HA');
+      expect(thousands.declaredHectares, closeTo(1000, 1e-6));
+    });
+
+    test('column-major Y then X keeps every beacon', () {
+      final text = [
+        'CO-ORDINATES System LO. 27°',
+        'Beacon',
+        'A',
+        'B',
+        'C',
+        'D',
+        'Y',
+        '+103208.35',
+        '+102825.87',
+        '+103190.55',
+        '+103510.96',
+        'X',
+        '+2702523.47',
+        '+2702748.44',
+        '+2702993.47',
+        '+2702809.52',
+      ].join('\n');
+      final result = OcrService.parseRecognizedText(text);
+      expect(result.suggestedZone, 27);
+      expect(result.pairs.length, 4);
+      expect(result.pairs[0].westing, closeTo(103208.35, 0.01));
+      expect(result.pairs[0].southing, closeTo(2702523.47, 0.01));
+      expect(result.pairs[3].westing, closeTo(103510.96, 0.01));
+      expect(result.pairs[3].southing, closeTo(2702809.52, 0.01));
+    });
+
+    test('alternating bare Y/X lines are not zipped as columns', () {
+      final pairs = OcrService.parseLoCoordinates(
+        '-74283\n2609149\n-74593\n2609153',
+      );
+      expect(pairs.length, 2);
+      expect(pairs[0].westing, closeTo(-74283, 0.01));
+      expect(pairs[0].southing, closeTo(2609149, 0.01));
+      expect(pairs[1].westing, closeTo(-74593, 0.01));
+      expect(pairs[1].southing, closeTo(2609153, 0.01));
     });
 
   });

@@ -6,6 +6,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
 import '../../core/lo_converter.dart';
+import '../../core/lo_format.dart';
 import '../../core/distance_format.dart';
 import '../../core/guided_path.dart';
 import '../../core/path_guidance.dart';
@@ -163,8 +164,8 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
         if (la == null || lo == null) return mapPt;
         return ll.LatLng(la, lo);
       case _PointSource.lo:
-        final w = double.tryParse(y.text.trim());
-        final s = double.tryParse(x.text.trim());
+        final w = tryParseLoNumber(y.text);
+        final s = tryParseLoNumber(x.text);
         if (w == null || s == null) return null;
         return LoConverter.toWgs84(
           westing: w,
@@ -395,8 +396,8 @@ class _PathfinderScreenState extends State<PathfinderScreen> {
     double? loY;
     double? loX;
     if (includeLo && y != null && x != null) {
-      loY = double.tryParse(y.text.trim());
-      loX = double.tryParse(x.text.trim());
+      loY = tryParseLoNumber(y.text);
+      loX = tryParseLoNumber(x.text);
     }
     await promptAndSaveWaypoint(
       context,

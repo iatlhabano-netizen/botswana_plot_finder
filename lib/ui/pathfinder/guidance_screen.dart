@@ -15,6 +15,7 @@ import '../../core/guided_path.dart';
 import '../../core/line_hysteresis.dart';
 import '../../core/line_projector.dart';
 import '../../core/path_guidance.dart';
+import '../../services/device_bridge.dart';
 import '../../services/external_maps.dart';
 import '../../services/gps_service.dart';
 import '../theme.dart';
@@ -102,12 +103,16 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
   final GpsSmoother _smoother = GpsSmoother();
   final DualEma _ema = DualEma();
   final LineHysteresis _hyst = LineHysteresis();
+  final CorridorWidthFilter _corridorFilter = CorridorWidthFilter();
   final HybridMapController _mapCtrl = HybridMapController();
 
   bool _sunlight = false;
   bool _showCompass = false;
   DateTime? _lastFixAt;
   Timer? _staleTimer;
+  double? _displayCorridor;
+  double? _deviceDeclination;
+  DateTime? _declinationAt;
 
   @override
   void initState() {
@@ -156,17 +161,22 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
 
       _gpsSub = GpsService.watch(
         accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 1,
+        // 0 = every GNSS fix. A 1 m filter hid the sub-metre corrections a
+        // ±1.8 m corridor actually needs, and froze the hero while you stood
+        // still and stepped sideways.
+        distanceFilter: 0,
       ).listen(_onPos);
     } catch (e) {
       if (mounted) setState(() => _error = 'GPS error: $e');
     }
   }
 
-  double get _tol => Corridor.halfWidthM(
-        baseTolM: _baseTolM,
-        accuracyM: _accuracyM,
-      );
+  double get _tol =>
+      _displayCorridor ??
+      Corridor.halfWidthM(baseTolM: _baseTolM, accuracyM: _accuracyM);
+
+  double get _declinationDeg =>
+      _deviceDeclination ?? PathGuidance.botswanaDeclinationDeg;
 
   bool get _gpsStale {
     if (_lastFixAt == null) return false;
@@ -207,6 +217,11 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
       final proj = _projector.project(cur, _path.points, labels: _path.labels);
       if (proj == null) return;
 
+      // Cross-track is signed in the active leg's frame. Blending across a
+      // bend mixes two directions and can announce the wrong side.
+      if (proj.legIndex != prevLeg) {
+        _ema.reset();
+      }
       final ema = _ema.update(proj.crossTrackM, proj.alongPathM);
       xt = ema.cross;
       alongPath = ema.along.clamp(0.0, proj.totalM);
@@ -226,9 +241,11 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
       }
     }
 
-    final corridor = widget.locateMode
-        ? PathGuidance.corridorToleranceM(baseTolM: _baseTolM, accuracyM: acc)
-        : Corridor.halfWidthM(baseTolM: _baseTolM, accuracyM: acc);
+    final rawCorridor = Corridor.halfWidthM(
+      baseTolM: _baseTolM,
+      accuracyM: acc,
+    );
+    final corridor = _corridorFilter.update(rawCorridor);
 
     final prevSide = _lineSide;
     final side = widget.locateMode
@@ -236,11 +253,20 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         : _hyst.update(xt, corridor);
 
     if (!widget.locateMode && prevSide != side && !arrived) {
-      HapticFeedback.lightImpact();
+      // Corridor leave: stronger haptic + beep (debounced in DeviceBridge).
+      // Other side changes (e.g. LEFT↔RIGHT, re-enter): light tick only.
+      if (prevSide == LineSide.onLine && side != LineSide.onLine) {
+        HapticFeedback.mediumImpact();
+        DeviceBridge.beep();
+      } else {
+        HapticFeedback.lightImpact();
+      }
     }
     if (!_arrived && arrived) {
       HapticFeedback.mediumImpact();
     }
+
+    _maybeRefreshDeclination(cur);
 
     if (!mounted) return;
     setState(() {
@@ -259,7 +285,30 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
       _projected = projected;
       _legIndex = leg;
       _lineSide = side;
+      _displayCorridor = corridor;
       if (widget.locateMode) _applyAutoMode();
+    });
+  }
+
+  void _maybeRefreshDeclination(ll.LatLng at) {
+    final now = DateTime.now();
+    if (_declinationAt != null &&
+        now.difference(_declinationAt!).inSeconds < 60) {
+      return;
+    }
+    _declinationAt = now;
+    DeviceBridge.declination(at).then((deg) {
+      if (!mounted || deg == null) return;
+      setState(() => _deviceDeclination = deg);
+    });
+  }
+
+  void _nudgeCorridor(double delta) {
+    setState(() {
+      _baseTolM = (_baseTolM + delta).clamp(0.5, 12.0);
+      _displayCorridor = _corridorFilter.snap(
+        Corridor.halfWidthM(baseTolM: _baseTolM, accuracyM: _accuracyM),
+      );
     });
   }
 
@@ -370,6 +419,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
         headingMagDeg: _headingMag,
         desiredTrueBearingDeg: _targetBearingTrue,
         xtM: null,
+        declinationDeg: _declinationDeg,
       );
     }
     switch (_lineSide) {
@@ -410,7 +460,10 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
     final statusText = _heroText;
     final statusColor = _heroColor;
     final onLine = statusText == 'ON LINE' || statusText == 'ON PATH';
-    final magTarget = PathGuidance.trueToMagnetic(_targetBearingTrue);
+    final magTarget = PathGuidance.trueToMagnetic(
+      _targetBearingTrue,
+      declinationDeg: _declinationDeg,
+    );
     final needsCalib =
         _compassAccuracy != null && _compassAccuracy! < 0;
     final farAway = DistanceFormat.preferRoadDirections(_distRemain);
@@ -872,8 +925,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
               children: [
                 IconButton(
                   tooltip: 'Narrower corridor',
-                  onPressed: () => setState(() =>
-                      _baseTolM = (_baseTolM - 0.5).clamp(0.5, 12.0)),
+                  onPressed: () => _nudgeCorridor(-0.5),
                   icon: const Icon(Icons.remove_circle_outline),
                 ),
                 Text(
@@ -882,8 +934,7 @@ class _GuidanceScreenState extends State<GuidanceScreen> {
                 ),
                 IconButton(
                   tooltip: 'Wider corridor',
-                  onPressed: () => setState(() =>
-                      _baseTolM = (_baseTolM + 0.5).clamp(0.5, 12.0)),
+                  onPressed: () => _nudgeCorridor(0.5),
                   icon: const Icon(Icons.add_circle_outline),
                 ),
               ],

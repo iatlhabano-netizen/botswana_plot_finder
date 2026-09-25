@@ -38,3 +38,35 @@ class Corridor {
     return [...left, ...right.reversed];
   }
 }
+
+/// Stops the on-line band and the map corridor from jumping when a single
+/// GPS accuracy sample spikes. Widens faster than it shrinks: a bad fix
+/// must not hide a real offset, and a good fix must not snap the polygon shut.
+class CorridorWidthFilter {
+  double? _width;
+
+  static const double widenStepM = 1.2;
+  static const double shrinkStepM = 0.25;
+
+  double? get width => _width;
+
+  void reset() => _width = null;
+
+  /// User tapped ± corridor — follow immediately.
+  double snap(double next) {
+    _width = next;
+    return next;
+  }
+
+  double update(double next) {
+    final prev = _width;
+    if (prev == null) {
+      _width = next;
+      return next;
+    }
+    final step = next > prev ? widenStepM : shrinkStepM;
+    final delta = (next - prev).clamp(-step, step);
+    _width = prev + delta;
+    return _width!;
+  }
+}

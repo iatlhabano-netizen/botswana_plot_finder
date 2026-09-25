@@ -8,6 +8,10 @@ import 'line_geo.dart';
 ///
 /// Blends dump2/Qwen grace (hold on small jumps) with catch-up (raise alpha /
 /// snap on large teleports). Poor accuracy → trust prediction more.
+///
+/// A grace hold does **not** keep integrating velocity — that was launching
+/// the estimate away from the last good fix. Velocity inferred from a
+/// sub-second innovation is clamped so one noisy sample cannot imply a sprint.
 class GpsSmoother {
   double _e = 0;
   double _n = 0;
@@ -18,10 +22,15 @@ class GpsSmoother {
   bool _initialized = false;
   double _accuracy = 50;
   int _holdCount = 0;
+  SmoothedFix? _last;
 
   /// Brief hold when a modest jump appears (grace), then accept.
   static const int jumpHoldFixes = 2;
   static const double jumpHoldM = 25;
+
+  /// Cap inferred speed. Kills 50 m/s spikes from a bad innovation / tiny dt
+  /// without freezing a vehicle on a farm track (~12 m/s ≈ 43 km/h).
+  static const double maxSpeedMps = 12;
 
   ll.LatLng? get origin => _origin;
   double get smoothedAccuracyM => _accuracy;
@@ -39,11 +48,14 @@ class GpsSmoother {
       _accuracy = acc;
       _initialized = true;
       _holdCount = 0;
-      return SmoothedFix(position: raw, accuracyM: acc, speedMps: 0);
+      return _last =
+          SmoothedFix(position: raw, accuracyM: acc, speedMps: 0);
     }
 
     var dt = (timeMs - _lastTMs) / 1000.0;
-    if (dt < 0.1) dt = 0.1;
+    // Duplicate timestamp or out-of-order burst: keep the last estimate.
+    // Do not stretch dt up to 0.1 s — that invented speed and overshot.
+    if (dt <= 0) return _last;
     if (dt > 10) dt = 10;
     _lastTMs = timeMs;
 
@@ -55,14 +67,14 @@ class GpsSmoother {
       _ve = 0;
       _vn = 0;
       _holdCount = 0;
-      return SmoothedFix(position: raw, accuracyM: acc, speedMps: 0);
+      return _last =
+          SmoothedFix(position: raw, accuracyM: acc, speedMps: 0);
     }
 
-    // Predict
-    _e += _ve * dt;
-    _n += _vn * dt;
-
-    final jump = sqrt(pow(en.e - _e, 2) + pow(en.n - _n, 2));
+    // Predict into locals. Commit only when the fix is accepted.
+    final predE = _e + _ve * dt;
+    final predN = _n + _vn * dt;
+    final jump = sqrt(pow(en.e - predE, 2) + pow(en.n - predN, 2));
 
     // Teleport / reacquire — snap immediately.
     if (jump > max(100.0, acc * 10)) {
@@ -73,11 +85,13 @@ class GpsSmoother {
       _accuracy = acc;
       _holdCount = 0;
     } else if (jump > max(jumpHoldM, acc * 3) && _holdCount < jumpHoldFixes) {
-      // Grace: hold estimate briefly, raise catch-up pressure next fixes.
+      // Grace: hold the last accepted estimate. Do not integrate velocity.
       _holdCount++;
       _accuracy = 0.85 * _accuracy + 0.15 * acc;
     } else {
       _holdCount = 0;
+      _e = predE;
+      _n = predN;
       // Higher alpha (=k) when accuracy is good; raise further after a hold.
       var k = (1.6 / acc).clamp(0.12, 0.85);
       if (jump > jumpHoldM) k = min(0.95, k + 0.25); // catch-up
@@ -85,12 +99,22 @@ class GpsSmoother {
       final rn = en.n - _n;
       _e += k * re;
       _n += k * rn;
-      _ve = 0.7 * _ve + 0.3 * (k * re / dt);
-      _vn = 0.7 * _vn + 0.3 * (k * rn / dt);
+      // Denominator floor so a 50 ms burst cannot imply 100 m/s.
+      final velDt = max(dt, 0.4);
+      var ve = 0.7 * _ve + 0.3 * (k * re / velDt);
+      var vn = 0.7 * _vn + 0.3 * (k * rn / velDt);
+      final spd = sqrt(ve * ve + vn * vn);
+      if (spd > maxSpeedMps) {
+        final scale = maxSpeedMps / spd;
+        ve *= scale;
+        vn *= scale;
+      }
+      _ve = ve;
+      _vn = vn;
       _accuracy = 0.7 * _accuracy + 0.3 * acc;
     }
 
-    return SmoothedFix(
+    return _last = SmoothedFix(
       position: LineGeo.fromEnu(_origin!, _e, _n),
       accuracyM: _accuracy,
       speedMps: sqrt(_ve * _ve + _vn * _vn),
@@ -101,6 +125,9 @@ class GpsSmoother {
     _initialized = false;
     _origin = null;
     _holdCount = 0;
+    _last = null;
+    _ve = 0;
+    _vn = 0;
   }
 }
 

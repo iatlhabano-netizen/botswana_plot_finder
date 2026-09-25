@@ -17,17 +17,32 @@ class AreaVerificationResult {
 }
 
 class AreaAuditor {
-  /// Scans OCR text for declared area (e.g., "(9.6HA)" or "9.6 HA" or "9.6HECTARES")
+  /// Scans OCR text for declared area (e.g., "(9.6HA)", "9,6 HA", "16,1541 hectares").
+  ///
+  /// A comma is a Land Board decimal (`16,154` → 16.154 ha, `16,1541` → 16.1541)
+  /// unless it is a round thousands group (`1,000` / `12,000` → 1000 / 12000).
   static double? extractStatedArea(String text) {
     final regex = RegExp(
-      r'(\d+(?:\.\d+)?)\s*(?:HA|HECTARES?|\(HA\))',
+      r'(\d{1,7}(?:[.,]\d+)?)\s*(?:HA|HECTARES?|\(HA\))',
       caseSensitive: false,
     );
     final match = regex.firstMatch(text);
-    if (match != null) {
-      return double.tryParse(match.group(1)!);
+    if (match == null) return null;
+    return _parseAreaToken(match.group(1)!);
+  }
+
+  static double? _parseAreaToken(String token) {
+    if (token.contains(',') && !token.contains('.')) {
+      final comma = token.indexOf(',');
+      final frac = token.substring(comma + 1);
+      // Only `x,000` is thousands. `16,154` is 16.154 ha, not 16 154 ha.
+      final roundThousands = frac == '000';
+      if (roundThousands) {
+        return double.tryParse(token.replaceAll(',', ''));
+      }
+      return double.tryParse(token.replaceAll(',', '.'));
     }
-    return null;
+    return double.tryParse(token);
   }
 
   /// Compares computed (shoelace) area against certificate declared area.

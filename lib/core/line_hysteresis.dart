@@ -1,6 +1,10 @@
 /// ON LINE / LEFT / RIGHT Schmitt-trigger hysteresis.
 ///
 /// Enter ON LINE at ~0.85×corridor; leave only past ~1.12×corridor.
+/// Once outside the band, the announced side follows the sign of XTE
+/// (+RIGHT / −LEFT). The old latch kept the previous side until XTE crossed
+/// the far exit threshold, so a fix already on the other side of the line
+/// could still read RIGHT (or LEFT) by a couple of metres.
 /// Optional [confirmSamples] delays side flips / state changes.
 enum LineSide { onLine, left, right }
 
@@ -40,10 +44,10 @@ class LineHysteresis {
       }
     } else if (abs <= enter) {
       raw = LineSide.onLine;
-    } else if (state == LineSide.left) {
-      raw = xteM > exit ? LineSide.right : LineSide.left;
+    } else if (xteM > 0) {
+      raw = LineSide.right;
     } else {
-      raw = xteM < -exit ? LineSide.left : LineSide.right;
+      raw = LineSide.left;
     }
 
     if (raw == state) {

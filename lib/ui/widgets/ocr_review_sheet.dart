@@ -282,8 +282,8 @@ class _OcrReviewBodyState extends State<_OcrReviewBody> {
       final yt = _y[i].text.trim();
       final xt = _x[i].text.trim();
       if (yt.isEmpty && xt.isEmpty) continue;
-      final w = double.tryParse(yt);
-      final s = double.tryParse(xt);
+      final w = tryParseLoNumber(yt);
+      final s = tryParseLoNumber(xt);
       if (w == null || s == null) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Fix Y/X on row ${i + 1} before accepting.')),
